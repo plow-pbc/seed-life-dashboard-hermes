@@ -1,0 +1,10 @@
+*.log
+.DS_Store
+verify-report.json
+install-report.json
+
+# Nested dev clones of sibling SEED repos checked out alongside the
+# umbrella for cross-repo work — never part of this repo's tree.
+# Anchored to the repo root so a future tracked seed-* path elsewhere is
+# unaffected.
+/seed-*/
