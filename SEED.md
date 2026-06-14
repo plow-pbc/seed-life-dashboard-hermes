@@ -35,28 +35,26 @@ Standard system tools (on `PATH`): `curl`, `ssh`, `jq`, `docker` (the agent recu
 
 Install is **one-shot and agent-driven**. The installer's [preflight](https://github.com/plow-pbc/openseed/blob/main/SEED.md#preflight-is-rendered) reads the `### Requirements` table above and routes every unsatisfied operator input **once, up front** into its generated prepare-script, landing the values in `~/.config/seed/seed-life-dashboard-hermes.env` (mode 600, off-transcript). Sourcing, validation, and probe order are normative in [operator inputs are supplied by preflight](#operator-inputs-are-supplied-by-preflight) and [environment is probed up front](#environment-is-probed-up-front); at that same boundary — before any recursion — the installer mints, exports, **and persists** the rendezvous values per [rendezvous is minted](#rendezvous-is-minted) (the umbrella itself owns them — no hosted middleman; the state file lands at minting, so a run that dies anywhere downstream leaves the source-of-truth token on disk for the rerun to reuse instead of minting a split-brain rotation); the leaves-first recursion order follows the `## Dependencies` list above, and the viewer's transport and derived inputs have their own sections. The root has exactly **one Phase-2 step**: the activation block below ([skills are activated](#skills-are-activated-first-run)), which runs after all recursions complete. There is exactly **one path**: the SEED never prompts.
 
-After the children install, run the activation block. Installing the bundles is necessary but NOT sufficient — code that has never executed in the agent runtime proves nothing (the runtime context differs from the install host: different mounts, different DNS, different copies). The block asks the agent itself to register the wrapper-based crons and run every dashboard producer once, NOW, so [Verification](#verification) step 6 can assert the result:
+After the children install, run the activation block. Installing the skills is necessary but NOT sufficient — code that has never executed in the Hermes runtime proves nothing (the runtime context differs from the install host: the container's `/opt/data` mount, its DNS, its copy of the skills). The block is **host-driven**: it snapshots the four card baselines over SSH to the Pi, then runs each card-producing Hermes cron job once via `docker compose exec` — deterministic, no chat round-trip — so [Verification](#verification) step 6 can assert the result:
 
 ```bash
 set -euo pipefail
-# Activation: message the agent over its inbound channel. `linq` is the fixed
-# product-level inbound channel (the same constant Plow's own install smoke
-# seam posts to), not a per-household value. The bearer travels via a
-# mode-600 curl -K config file, never argv (argv is world-readable via
-# ps / /proc/<pid>/cmdline) — the same pattern ref/verify.sh uses.
-AS="$HOME/Library/Application Support/${PLOW_BUNDLE_ID:-co.plow.app}"
-STATE_DIR="$HOME/Library/Application Support/seed-life-dashboard"
-# Baseline FIRST, then send: snapshot a SHA-256 of each rendered card slot as
-# it stands before the agent is asked to run the producers. The store is
-# latest-per-card with no timestamps, so "card is non-null" cannot prove THIS
-# run's producers executed — Verification step 6 instead requires every card
-# to differ from this baseline. Hashes only (no card text) land on disk.
-# Capture-then-hash (command substitution strips trailing newlines) so both
-# sides of the comparison normalize identically — verify.sh hashes the same
-# way. This block runs on the Mac, where shasum is guaranteed.
+# Activation is HOST-DRIVEN: snapshot the four card baselines, then drive each
+# card-producing Hermes cron job once via `docker compose exec`. The umbrella
+# state dir holds the baseline (hashes only, never card text).
+STATE_DIR="${SEED_LD_HERMES_STATE_DIR:-$HOME/.local/state/seed-life-dashboard-hermes}"
+HERMES_SCAFFOLD="${HERMES_SCAFFOLD:-./hermes-agent}"
+HERMES_SERVICE="${HERMES_SERVICE:-hermes-agent}"   # the seed-hermes compose service the producers run in
+# Baseline FIRST, then run: snapshot a SHA-256 of each rendered card slot as
+# it stands before the producers run. The store is latest-per-card with no
+# timestamps, so "card is non-null" cannot prove THIS run's producers
+# executed — Verification step 6 instead requires every card to differ from
+# this baseline. Hashes only (no card text) land on disk. Capture-then-hash
+# (command substitution strips trailing newlines) so both sides of the
+# comparison normalize identically — verify.sh hashes the same way.
 BASE_TMP=""
-CFG=""
-trap 'rm -f "$CFG" "$BASE_TMP"' EXIT
+mkdir -p "$STATE_DIR"
+trap 'rm -f "$BASE_TMP"' EXIT
 BASE_TMP=$(mktemp "$STATE_DIR/activation-baseline.XXXXXX")
 for c in 1 2 3 4; do
   # A failed snapshot (SSH or curl error) aborts via the named handler
@@ -71,24 +69,18 @@ for c in 1 2 3 4; do
 done > "$BASE_TMP"
 mv "$BASE_TMP" "$STATE_DIR/activation-baseline"
 BASE_TMP=""
-CFG=$(mktemp); chmod 600 "$CFG"
-# Plain assignment so a missing token file trips set -e with cat's own
-# clear error, instead of writing an empty bearer and dying later as 401.
-TOKEN=$(cat "$AS/plow-api-token")
-printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$CFG"
-TEXT="[seed-life-dashboard activation] Register the ld-morning-updates, \
-ld-morning-triage, and ld-weekly-digest crons per each bundle's SKILL.md \
-Scheduling section, then run each dashboard producer once now: post the \
-most important unattended item from the household's messages (card 1, \
-type alert), a morning affirmation (card 2, type affirmation), a weather \
-card (card 3, type weather), and a weekly digest (card 4, type digest), \
-so every rendered card holds real data. The post wrappers print nothing \
-on success - confirm each with '&& echo POSTED'."
-jq -n --arg t "$TEXT" '{text: $t}' \
-  | curl -fsS -K "$CFG" -H "Content-Type: application/json" \
-      -d @- https://api.plow.co/channels/linq/inbound \
-  | jq -e '.delivered == true' >/dev/null \
-  && echo "activation message delivered"
+# Drive each card-producing job once via the Hermes container. The agent seed
+# registered these jobs (keyed by name) during its recursion; running them
+# host-side lands the four rendered cards (1 alert, 2 affirmation, 3 weather,
+# 4 digest) through the same runtime path (mount, DNS, env) the scheduled
+# ticks use. ld-sports (card 5) and ld-calendar-nudge are not part of the
+# four-card baseline contract, so the activation kick does not run them.
+COMPOSE="$HERMES_SCAFFOLD/compose.yaml"
+for job in ld-morning-triage ld-morning-updates ld-weather ld-weekly-digest; do
+  docker compose -f "$COMPOSE" exec -T "$HERMES_SERVICE" hermes cron run "$job" \
+    || { echo "FAIL: activation run $job" >&2; exit 1; }
+done
+echo "activation runs dispatched"
 ```
 
 ## Objects
@@ -150,7 +142,7 @@ set -euo pipefail
 # materialized copies); else mint fresh. A PRESENT-but-unreadable state file
 # hard-fails instead of silently minting a rotation: a partial re-run would
 # otherwise leave the Pi holding the old token. Never echoed, never on argv.
-STATE_DIR="$HOME/Library/Application Support/seed-life-dashboard"
+STATE_DIR="${SEED_LD_HERMES_STATE_DIR:-$HOME/.local/state/seed-life-dashboard-hermes}"
 STATE="$STATE_DIR/state.json"
 DASHBOARD_TOKEN=""
 if [ -f "$STATE" ]; then
@@ -180,8 +172,8 @@ jq -n --arg pi "$LD_PI_SSH_TARGET" --arg ep "$ENDPOINT_URL" \
 mv "$TMP" "$STATE"
 ```
 
-- The viewer recursion consumes `ICAL_URL` + `DASHBOARD_TOKEN` (landing in its `.env`; there is no `MESSAGE_API_URL` — the message backend IS the viewer's own server). The agent recursion consumes `DASHBOARD_ENDPOINT_URL` + `DASHBOARD_TOKEN`.
-- `http://` is deliberate: the endpoint lives on the household LAN or tailnet, and a Tailscale hostname is encrypted on the wire anyway — plaintext-LAN is the documented trade-off. A household whose Plow VM can't resolve the SSH hostname can set `LD_PI_SSH_TARGET` with an IP or tailnet FQDN instead.
+- The viewer recursion consumes `ICAL_URL` + `DASHBOARD_TOKEN` (landing in its `.env`; there is no `MESSAGE_API_URL` — the message backend IS the viewer's own server). The agent recursion consumes `DASHBOARD_ENDPOINT_URL` + `DASHBOARD_TOKEN`, which its installer writes into the seed-hermes scaffold's `data/.env` (mode 600) — the producers read both from the container environment; there is no Plow secrets mount.
+- `http://` is deliberate: the endpoint lives on the household LAN or tailnet, and a Tailscale hostname is encrypted on the wire anyway — plaintext-LAN is the documented trade-off. A household whose Hermes container can't resolve the SSH hostname can set `LD_PI_SSH_TARGET` with an IP or tailnet FQDN instead.
 
 ### Environment is probed up front
 
@@ -208,10 +200,10 @@ The viewer is a declared SEED dep whose install host is the **Pi, not this Mac**
 
 The install is NOT complete when the bundles are merely on disk — it is complete when the agent has **executed** each dashboard producer once and the cards exist. This action is the root's single Phase-2 step (the block in [`## Dependencies`](#dependencies)); [Verification](#verification) step 6 asserts its observable outcome.
 
-1. After every child recursion terminates `success`, the installer POSTs one inbound message to the agent (the activation block — bearer from `plow-api-token`, via a mode-600 curl `-K` config file, never argv).
-2. The agent (openclaw), on receipt: registers the three wrapper-based crons (`ld-morning-updates`, `ld-morning-triage`, `ld-weekly-digest`) per each bundle's `SKILL.md` Scheduling section, then runs each producer once — landing the `alert` (card `1`), `affirmation` (card `2`), `weather` (card `3`), and `digest` (card `4`) cards on the dashboard through the same runtime path (VM mounts, `/config` secrets, VM network) the scheduled ticks will use.
-3. The installer does not parse the agent's prose reply — the Pi store is the ground truth, asserted by Verification step 6. A populated store proves the whole producer chain: current bundle code visible to the VM, endpoint reachable *from inside the VM* (not just from the Mac), valid token, store writable.
-4. Why this is a verification criterion and not a courtesy note: the failure class it catches is *silent* — bundles installed but never executed (stale VM-side copies, VM-unresolvable endpoint host, unregistered crons). Every pre-condition check (files on disk, token equality, Mac-side smoke) passes in that state while the kiosk stays empty until 07:00 — or forever.
+1. After every child recursion terminates `success` — the agent seed already registered one Hermes cron per producer (keyed by name) during its recursion — the installer snapshots the four card baselines over SSH and runs each card-producing job once host-side: `docker compose exec -T <service> hermes cron run <job>` for `ld-morning-triage`, `ld-morning-updates`, `ld-weather`, `ld-weekly-digest` (the activation block above). This is deterministic and needs no chat round-trip.
+2. Each run lands its card on the dashboard — the `alert` (card `1`), `affirmation` (card `2`), `weather` (card `3`), and `digest` (card `4`) cards — through the same runtime path (the container's `/opt/data` mount, its `data/.env` credentials, the container network) the scheduled ticks will use.
+3. The installer does not parse the cron run's output — the Pi store is the ground truth, asserted by Verification step 6. A populated store proves the whole producer chain: current skill code visible to the container, endpoint reachable *from inside the container* (not just from the Docker host), valid token, store writable.
+4. Why this is a verification criterion and not a courtesy note: the failure class it catches is *silent* — skills installed but never executed (stale container-side copies, container-unresolvable endpoint host, unregistered crons). Every pre-condition check (files on disk, token equality, host-side smoke) passes in that state while the kiosk stays empty until 07:00 — or forever.
 
 ## Verification
 
