@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Deterministic implementation of SEED.md ## Verification for the umbrella.
+# Deterministic implementation of SEED.md ## Verification for the Hermes umbrella.
 #
 # Reads the umbrella's own state file as the source of truth for the
-# bearer and the endpoint, then compares (a) the agent's dashboard-token
-# value locally (trailing-newline-insensitive via command substitution —
-# the agent's jq write newline-terminates the file; see SEED.md
-# ## Verification step 2), and (b) the Pi's .env DASHBOARD_TOKEN via
-# SHA-256 hash over SSH (so the value never lands on the local
-# terminal). Finally, runs an end-to-end smoke from the Mac directly to
-# the Pi's published /api/message (proving Mac→Pi reachability) and back
-# out via the Pi's localhost API (the same store the kiosk reads), using
-# the fixed, non-rendered probe card __umbrella_verify__ — the store is
-# latest-per-card with no DELETE route, so a fixed card keeps it bounded
-# at one inert probe field; per-run uniqueness lives in the text.
+# bearer and the endpoint, then compares (a) the producers' DASHBOARD_TOKEN
+# value as written into the seed-hermes scaffold's data/.env (the agent
+# seed writes the RHS verbatim; see SEED.md ## Verification step 2), and
+# (b) the Pi's .env DASHBOARD_TOKEN via SHA-256 hash over SSH (so the value
+# never lands on the local terminal). Finally, runs an end-to-end smoke from
+# the Docker host directly to the Pi's published /api/message (proving
+# host→Pi reachability) and back out via the Pi's localhost API (the same
+# store the kiosk reads), using the fixed, non-rendered probe card
+# __umbrella_verify__ — the store is latest-per-card with no DELETE route,
+# so a fixed card keeps it bounded at one inert probe field; per-run
+# uniqueness lives in the text.
 #
 # The Authorization: Bearer <STATE_TOKEN> header is passed to curl via
 # a mode-600 -K config file, NOT via -H "Authorization: ..." on argv —
@@ -21,28 +21,39 @@
 
 set -euo pipefail
 
+# The seed-hermes scaffold dir holds the producers' data/.env (agent-side
+# token write-side). Default ./hermes-agent; overridable via --scaffold or
+# HERMES_SCAFFOLD, mirroring the agent seed's installer + verifier.
+SCAFFOLD_DIR="${HERMES_SCAFFOLD:-./hermes-agent}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --scaffold) SCAFFOLD_DIR="$2"; shift 2 ;;
+    *) echo "Unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+AGENT_ENV="${SCAFFOLD_DIR%/}/data/.env"
+
 # accept-new: trust a never-seen Pi host key on first contact (TOFU) so an
 # unattended run doesn't stall; a later key change still hard-fails.
 SSH_OPTS="-o StrictHostKeyChecking=accept-new"
 
-PLOW_BUNDLE_ID="${PLOW_BUNDLE_ID:-co.plow.app}"
-APP_SUPPORT="$HOME/Library/Application Support/$PLOW_BUNDLE_ID"
-AGENT_TOKEN="$APP_SUPPORT/agent-runtime/secrets/dashboard-token"
-UMBRELLA_STATE="$HOME/Library/Application Support/seed-life-dashboard/state.json"
+STATE_DIR="${SEED_LD_HERMES_STATE_DIR:-$HOME/.local/state/seed-life-dashboard-hermes}"
+UMBRELLA_STATE="$STATE_DIR/state.json"
 
-[ -f "$UMBRELLA_STATE" ] || { echo "FAIL v-link: umbrella state missing" >&2; exit 1; }
-[ -f "$AGENT_TOKEN" ] || { echo "FAIL v-link: agent token missing at $AGENT_TOKEN" >&2; exit 1; }
+[ -f "$UMBRELLA_STATE" ] || { echo "FAIL v-link: umbrella state missing at $UMBRELLA_STATE" >&2; exit 1; }
+[ -f "$AGENT_ENV" ] || { echo "FAIL v-link: scaffold data/.env missing at $AGENT_ENV" >&2; exit 1; }
 
 PI_TARGET=$(jq -re .pi_ssh_target "$UMBRELLA_STATE")
 
 # v-children: every declared child SEED's install terminated `success`.
 # Each child's install-report.json lives at its $REPO_ROOT — the installer
-# cache for the Mac-side children, the Pi's cache for the viewer (cloned
-# there per the remote-host transport contract). The Pi check parses with
-# node (jq is not in the viewer's system-package set; node >=20.6 is), so
-# both transports assert the same top-level-key predicate.
+# cache for the host-side children (durable-ssh, hermes-plow, hermes-agent),
+# the Pi's cache for the viewer (cloned there per the remote-host transport
+# contract). The Pi check parses with node (jq is not in the viewer's
+# system-package set; node >=20.6 is), so both transports assert the same
+# top-level-key predicate.
 CHILD_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/seed/github.com/plow-pbc"
-for child in seed-durable-ssh seed-life-dashboard-agent; do
+for child in seed-durable-ssh seed-hermes-plow seed-life-dashboard-hermes-agent; do
   R="$CHILD_CACHE/$child/install-report.json"
   [ "$(jq -r .terminal_reason "$R" 2>/dev/null)" = success ] \
     || { echo "FAIL v-children: $child terminal_reason != success, or report unreadable (expected: $R)" >&2; exit 1; }
@@ -51,15 +62,18 @@ ssh $SSH_OPTS -- "$PI_TARGET" 'bash -l -c '\''node -e "process.exit(JSON.parse(r
   || { echo "FAIL v-children: viewer terminal_reason != success, or report unreadable over SSH (Pi cache clone)" >&2; exit 1; }
 echo "OK   v-children"
 
-# v-link-agent: agent's dashboard-token == umbrella's state.json:dashboard_token.
+# v-link-agent: the producers' DASHBOARD_TOKEN (the RHS in the scaffold's
+# data/.env) == umbrella's state.json:dashboard_token. The value is read by
+# stripping the KEY= prefix and never echoed.
 STATE_TOKEN=$(jq -re .dashboard_token "$UMBRELLA_STATE")
-AGENT_TOKEN_VAL=$(cat "$AGENT_TOKEN")
+AGENT_TOKEN_VAL=$(grep -m1 -E '^DASHBOARD_TOKEN=' "$AGENT_ENV" | sed 's/^DASHBOARD_TOKEN=//')
 if [ "$STATE_TOKEN" = "$AGENT_TOKEN_VAL" ]; then
   echo "OK   v-link-agent"
 else
-  echo "FAIL v-link-agent: agent dashboard-token does not match umbrella state token" >&2
+  echo "FAIL v-link-agent: scaffold data/.env DASHBOARD_TOKEN does not match umbrella state token" >&2
   exit 1
 fi
+unset AGENT_TOKEN_VAL
 
 # Build a mode-600 curl config file carrying the Authorization header.
 # `printf` is a bash builtin (`type printf` → builtin), so its argv
@@ -77,7 +91,7 @@ PI_SHA=$(ssh $SSH_OPTS -- "$PI_TARGET" bash -s <<'REMOTE'
 set -euo pipefail
 VAL=$(grep '^DASHBOARD_TOKEN=' "$HOME/services/life-dashboard-viewer/.env" | sed 's/^DASHBOARD_TOKEN=//')
 # Stock Raspberry Pi OS ships sha256sum but often not shasum; prefer it,
-# fall back to shasum so the digest matches the Mac-side shasum output.
+# fall back to shasum so the digest matches the host-side shasum output.
 printf '%s' "$VAL" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | awk '{print $1}'
 REMOTE
 )
@@ -88,7 +102,7 @@ else
   exit 1
 fi
 
-# v-e2e: synthetic POST from the Mac directly to the Pi's published
+# v-e2e: synthetic POST from the Docker host directly to the Pi's published
 # endpoint; Pi GET via localhost (filtered to the same card) → assert the
 # sentinel round-trips. The probe CARD is the FIXED `__umbrella_verify__`:
 # the store is latest-per-card with no DELETE route (any non-GET/POST is
@@ -113,7 +127,7 @@ curl -fsS -K "$CURL_CFG" \
 # The Pi's local /api/message is served by the viewer's own store (per
 # life-dashboard-viewer.service) — the same one the published endpoint
 # above wrote to. curling localhost:5174 with the probe card confirms the
-# kiosk-side read path works end-to-end: Mac → Pi store → kiosk read.
+# kiosk-side read path works end-to-end: host → Pi store → kiosk read.
 PI_RESPONSE=$(ssh $SSH_OPTS -- "$PI_TARGET" "curl -fsS 'http://localhost:5174/api/message?card=$PROBE_CARD'")
 if printf '%s' "$PI_RESPONSE" | grep -q "$SENTINEL"; then
   echo "OK   v-e2e"
@@ -144,21 +158,21 @@ else
   exit 1
 fi
 
-# v-populated: the install isn't done until the agent has actually RUN the
-# ld-* producers once (driven by the Dependencies activation block) and all
-# four rendered card slots hold data in the Pi's store THAT CHANGED during
-# this run. The store is latest-per-card with no timestamps, so non-null
-# alone would pass on a prior install's stale cards; each card must differ
-# from the SHA-256 baseline the activation block snapshotted before
-# messaging the agent, and must carry its slot's expected type (the kiosk
-# eyebrow renders the posted type verbatim): 1 alert, 2 affirmation,
-# 3 weather, 4 digest. This catches the silent-empty AND silently-stale
-# classes no on-disk or Mac-side check can see: bundles landed but never
-# executed (stale VM-side copies, endpoint host unresolvable from inside
-# the agent VM, crons never registered). The umbrella smoke above uses the
-# non-rendered __umbrella_verify__ card and never touches these slots.
-# Fixed 600s timeout — agent turns take minutes, not seconds.
-BASELINE="$HOME/Library/Application Support/seed-life-dashboard/activation-baseline"
+# v-populated: the install isn't done until the ld-* producers have actually
+# RUN once (driven host-side by the Dependencies activation block's
+# `hermes cron run` loop) and all four rendered card slots hold data in the
+# Pi's store THAT CHANGED during this run. The store is latest-per-card with
+# no timestamps, so non-null alone would pass on a prior install's stale
+# cards; each card must differ from the SHA-256 baseline the activation block
+# snapshotted before running the producers, and must carry its slot's expected
+# type (the kiosk eyebrow renders the posted type verbatim): 1 alert,
+# 2 affirmation, 3 weather, 4 digest. This catches the silent-empty AND
+# silently-stale classes no on-disk or host-side check can see: skills landed
+# but never executed (stale container-side copies, endpoint host unresolvable
+# from inside the container, crons never registered). The umbrella smoke above
+# uses the non-rendered __umbrella_verify__ card and never touches these slots.
+# Fixed 600s timeout — producer runs take minutes, not seconds.
+BASELINE="$STATE_DIR/activation-baseline"
 [ -f "$BASELINE" ] || { echo "FAIL v-populated: activation baseline missing — the activation block did not run" >&2; exit 1; }
 DEADLINE=$(( $(date +%s) + 600 ))
 MISSING="1:alert 2:affirmation 3:weather 4:digest"
@@ -187,8 +201,8 @@ while :; do
   if [ -z "$MISSING" ]; then echo "OK   v-populated"; break; fi
   if [ "$(date +%s)" -ge "$DEADLINE" ]; then
     echo "FAIL v-populated: card slots (card:type) still empty, mistyped, or unchanged from pre-activation baseline after 600s: $MISSING" >&2
-    echo "      (bundles may be installed but never executed in the agent runtime —" >&2
-    echo "       check VM-visible skill copies, VM->Pi endpoint reachability, cron registration)" >&2
+    echo "      (skills may be installed but never executed in the Hermes runtime —" >&2
+    echo "       check container-visible skill copies, container->Pi endpoint reachability, cron registration)" >&2
     exit 1
   fi
   sleep 15
