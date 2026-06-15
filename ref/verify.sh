@@ -119,7 +119,7 @@ VAL=$(grep '^DASHBOARD_TOKEN=' "$HOME/services/life-dashboard-viewer/.env" | sed
 printf '%s' "$VAL" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | awk '{print $1}'
 REMOTE
 ); then
-  echo "FAIL v-link-viewer: ssh/remote error reading viewer .env token on Pi" >&2; exit 1
+  echo "FAIL v-link-viewer: cannot read viewer .env DASHBOARD_TOKEN on Pi (missing file/token or Pi unreachable)" >&2; exit 1
 fi
 if [ "$STATE_SHA" = "$PI_SHA" ]; then
   echo "OK   v-link-viewer"
