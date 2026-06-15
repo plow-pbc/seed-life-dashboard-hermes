@@ -244,7 +244,7 @@ else
   # The chat bearer rides its own mode-600 -K config — argv is world-readable
   # through /proc/<pid>/cmdline and `ps`. `printf` is a bash builtin, so the
   # token never appears on any argv; the file is removed by the EXIT trap below.
-  CHAT_CFG=$(mktemp -t umbrella-handoff-curl)
+  CHAT_CFG=$(mktemp "${TMPDIR:-/tmp}/umbrella-handoff-curl.XXXXXX")
   trap 'rm -f "$CURL_CFG" "$CHAT_CFG"' EXIT
   chmod 600 "$CHAT_CFG"
   printf 'header = "Authorization: Bearer %s"\n' "$CHAT_TOKEN" > "$CHAT_CFG"
