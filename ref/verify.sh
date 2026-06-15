@@ -51,7 +51,7 @@ PI_TARGET=$(jq -re .pi_ssh_target "$UMBRELLA_STATE")
 # The scaffold data/.env now lives on the Pi; existence is checked there
 # (the on-Pi path may reference $HOME/$SEED_HOME, so it expands on the Pi).
 ssh $SSH_OPTS -- "$PI_TARGET" "[ -f \"$AGENT_ENV\" ]" \
-  || { echo "FAIL v-link: scaffold data/.env missing on Pi at $AGENT_ENV" >&2; exit 1; }
+  || { echo "FAIL v-link: scaffold data/.env missing on Pi (or Pi unreachable) at $AGENT_ENV" >&2; exit 1; }
 
 # v-children: every declared child SEED's install terminated `success`.
 # Each child's install-report.json lives at its $REPO_ROOT. In the
@@ -85,7 +85,11 @@ STATE_SHA=$(printf '%s' "$STATE_TOKEN" | shasum -a 256 | awk '{print $1}')
 # $HOME inside it expands ON THE PI, matching the existence check above). The
 # token value is hashed on the Pi; only the SHA-256 returns — the value never
 # lands on the install host's terminal (same discipline as v-link-viewer).
-AGENT_SHA=$(ssh $SSH_OPTS -- "$PI_TARGET" "bash -lc 'VAL=\$(grep -m1 \"^DASHBOARD_TOKEN=\" \"$AGENT_ENV\" | sed \"s/^DASHBOARD_TOKEN=//\"); printf %s \"\$VAL\" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | awk \"{print \\\$1}\"'")
+# Guarded capture: under `set -e` a bare AGENT_SHA=$(ssh …) would abort at the
+# assignment on an SSH/remote error, skipping the FAIL message below.
+if ! AGENT_SHA=$(ssh $SSH_OPTS -- "$PI_TARGET" "bash -lc 'VAL=\$(grep -m1 \"^DASHBOARD_TOKEN=\" \"$AGENT_ENV\" | sed \"s/^DASHBOARD_TOKEN=//\"); printf %s \"\$VAL\" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | awk \"{print \\\$1}\"'"); then
+  echo "FAIL v-link-agent: ssh/remote error reading scaffold token on Pi" >&2; exit 1
+fi
 if [ "$STATE_SHA" = "$AGENT_SHA" ]; then
   echo "OK   v-link-agent"
 else
@@ -105,14 +109,18 @@ printf 'header = "Authorization: Bearer %s"\n' "$STATE_TOKEN" > "$CURL_CFG"
 
 # v-link-viewer: Pi's .env DASHBOARD_TOKEN value SHA-256 matches umbrella's.
 # STATE_SHA was computed at v-link-agent above (same umbrella token).
-PI_SHA=$(ssh $SSH_OPTS -- "$PI_TARGET" bash -s <<'REMOTE'
+# Guarded capture (as v-link-agent): keep the FAIL message reachable on an
+# SSH/remote error rather than aborting silently at the assignment.
+if ! PI_SHA=$(ssh $SSH_OPTS -- "$PI_TARGET" bash -s <<'REMOTE'
 set -euo pipefail
 VAL=$(grep '^DASHBOARD_TOKEN=' "$HOME/services/life-dashboard-viewer/.env" | sed 's/^DASHBOARD_TOKEN=//')
 # Stock Raspberry Pi OS ships sha256sum but often not shasum; prefer it,
 # fall back to shasum so the digest matches the host-side shasum output.
 printf '%s' "$VAL" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | awk '{print $1}'
 REMOTE
-)
+); then
+  echo "FAIL v-link-viewer: ssh/remote error reading viewer .env token on Pi" >&2; exit 1
+fi
 if [ "$STATE_SHA" = "$PI_SHA" ]; then
   echo "OK   v-link-viewer"
 else
@@ -146,7 +154,9 @@ curl -fsS -K "$CURL_CFG" \
 # life-dashboard-viewer.service) — the same one the published endpoint
 # above wrote to. curling localhost:5174 with the probe card confirms the
 # kiosk-side read path works end-to-end: host → Pi store → kiosk read.
-PI_RESPONSE=$(ssh $SSH_OPTS -- "$PI_TARGET" "curl -fsS 'http://localhost:5174/api/message?card=$PROBE_CARD'")
+if ! PI_RESPONSE=$(ssh $SSH_OPTS -- "$PI_TARGET" "curl -fsS 'http://localhost:5174/api/message?card=$PROBE_CARD'"); then
+  echo "FAIL v-e2e: ssh/curl error reading Pi /api/message (Pi unreachable or viewer not serving)" >&2; exit 1
+fi
 if printf '%s' "$PI_RESPONSE" | grep -q "$SENTINEL"; then
   echo "OK   v-e2e"
 else
@@ -159,7 +169,7 @@ fi
 # unit is up nor that either survives a reboot. The viewer SEED installs
 # rootless --user units regardless of sudo availability; that is the one
 # supported namespace.
-PI_UNITS=$(ssh $SSH_OPTS -- "$PI_TARGET" bash -s <<'REMOTE'
+if ! PI_UNITS=$(ssh $SSH_OPTS -- "$PI_TARGET" bash -s <<'REMOTE'
 set -euo pipefail
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 for u in life-dashboard-viewer.service life-kiosk-viewer.service; do
@@ -168,13 +178,13 @@ for u in life-dashboard-viewer.service life-kiosk-viewer.service; do
 done
 echo OK
 REMOTE
-)
-if [ "$PI_UNITS" = OK ]; then
-  echo "OK   v-units"
-else
-  echo "FAIL v-units: $PI_UNITS" >&2
-  exit 1
+); then
+  # Remote exits non-zero both when a unit is down (PI_UNITS holds the
+  # "FAIL <u> not active/enabled" detail) and on a pure SSH error (empty).
+  echo "FAIL v-units: ${PI_UNITS:-ssh/remote error reaching Pi}" >&2; exit 1
 fi
+# Reaching here means the remote exited 0, which it does only after echoing OK.
+echo "OK   v-units"
 
 # v-populated: the install isn't done until the ld-* producers have actually
 # RUN once (driven host-side by the Dependencies activation block's
