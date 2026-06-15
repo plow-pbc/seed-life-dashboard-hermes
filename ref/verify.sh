@@ -43,6 +43,20 @@ UMBRELLA_STATE="$STATE_DIR/state.json"
 [ -f "$UMBRELLA_STATE" ] || { echo "FAIL v-link: umbrella state missing at $UMBRELLA_STATE" >&2; exit 1; }
 [ -f "$AGENT_ENV" ] || { echo "FAIL v-link: scaffold data/.env missing at $AGENT_ENV" >&2; exit 1; }
 
+# v-scaffold-exec: the scaffold container must be EXEC-able, not merely
+# running — the activation block and the agent-half cron registration both
+# `docker compose exec` into it. A container that is up but cannot start new
+# processes (e.g. an arm64 scaffold image on an x86_64 host whose qemu binfmt
+# handler was deregistered after boot — the main process survives but every
+# `exec` returns "exec format error") would pass a naive "running" check yet
+# fail every exec. A fast no-op exec proves it up front; HERMES_SERVICE
+# names the compose service (default hermes-agent), mirroring the activation
+# block in SEED.md ## Dependencies.
+HERMES_SERVICE="${HERMES_SERVICE:-hermes-agent}"
+docker compose -f "${SCAFFOLD_DIR%/}/compose.yaml" exec -T "$HERMES_SERVICE" true >/dev/null 2>&1 \
+  || { echo "FAIL v-scaffold-exec: seed-hermes scaffold container at ${SCAFFOLD_DIR%/} is not exec-able (\`docker compose exec\` failed). If the image is arm64 under qemu on an x86_64 host, the qemu binfmt handler was likely deregistered after boot — re-register with: docker run --privileged --rm tonistiigi/binfmt --install all" >&2; exit 1; }
+echo "OK   v-scaffold-exec"
+
 PI_TARGET=$(jq -re .pi_ssh_target "$UMBRELLA_STATE")
 
 # v-children: every declared child SEED's install terminated `success`.

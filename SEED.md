@@ -16,7 +16,7 @@ API / per-machine state — declared as the `### Requirements` manifest below so
 
 | kind     | label                       | phase     | satisfy                     | bypass                            |
 |----------|-----------------------------|-----------|-----------------------------|-----------------------------------|
-| hardware | Docker host running the seed-hermes scaffold (the container running, `./data:/opt/data`) | preflight | this machine (or the host the `--scaffold` dir lives on) | |
+| hardware | Docker host running the seed-hermes scaffold (the container running **AND exec-able** — `docker compose exec` must succeed, not merely up — `./data:/opt/data`) | preflight | this machine (or the host the `--scaffold` dir lives on) | |
 | hardware | Raspberry Pi over SSH (`user@host`) | preflight | LD_PI_SSH_TARGET            |                                   |
 | input    | Calendar ICS URL            | preflight | LD_ICAL_URL                 |                                   |
 | input    | Household owner's display name (how the dashboard refers to you) | preflight | LD_OWNER_NAME | |
@@ -183,6 +183,14 @@ The mid-install halts a first install can hit (unreachable Pi, missing Pi packag
 
 1. SSH reachability and key auth: proven by the `seed-durable-ssh` recursion — no umbrella-side step; the probes below ride its multiplexed connection.
 2. Pi system packages + sudo posture: run the viewer's system-packages probe (read from the viewer's SEED, already in the installer's host-side preflight cache, shipped over the SSH stdin transport) and `sudo -n true` now. Missing packages with passwordless sudo → nothing surfaces (the installer auto-runs the `apt` line at viewer time per [viewer is installed on the Pi](#viewer-is-installed-on-the-pi-over-ssh)); without passwordless sudo → the exact `apt` line joins the consolidated hand-back.
+3. Scaffold container is **exec-able**, not merely running: the agent-half cron registration and the activation block both `docker compose exec` into the seed-hermes scaffold, so a container that is up but cannot start new processes (the canonical case: an arm64 scaffold image on an x86_64 host whose qemu binfmt handler was deregistered after boot — the long-running main process survives, but every `exec` returns `exec format error`) would pass a naive "running" check and then fail every cron/activation step mid-install. Prove exec works up front with a fast no-op exec — fail-fast with an actionable message naming the qemu-binfmt cause and remedy when the container is up but exec fails:
+
+    ```bash
+    HERMES_SCAFFOLD="${HERMES_SCAFFOLD:-./hermes-agent}"
+    HERMES_SERVICE="${HERMES_SERVICE:-hermes-agent}"
+    docker compose -f "$HERMES_SCAFFOLD/compose.yaml" exec -T "$HERMES_SERVICE" true \
+      || { echo "FAIL: seed-hermes scaffold container is running but not exec-able (\`docker compose exec\` failed). If the scaffold image is arm64 running under qemu on an x86_64 host, the qemu binfmt handler was likely deregistered after boot — re-register it with: docker run --privileged --rm tonistiigi/binfmt --install all" >&2; exit 1; }
+    ```
 
 ### Viewer inputs are derived
 
