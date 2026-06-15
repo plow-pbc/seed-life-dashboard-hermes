@@ -48,7 +48,7 @@ set -euo pipefail
 # (hashes only, never card text).
 STATE_DIR="${SEED_LD_HERMES_STATE_DIR:-$HOME/.local/state/seed-life-dashboard-hermes}"
 # The seed-hermes scaffold lives in its clone on the Pi; this is the on-Pi path.
-HERMES_SCAFFOLD="${HERMES_SCAFFOLD:-${SEED_HOME:-\$HOME/seeds}/seed-hermes/hermes-agent}"
+HERMES_SCAFFOLD="${HERMES_SCAFFOLD:-\${SEED_HOME:-\$HOME/seeds}/seed-hermes/hermes-agent}"
 HERMES_SERVICE="${HERMES_SERVICE:-hermes}"   # the seed-hermes compose service the producers run in
 # Baseline FIRST, then run: snapshot a SHA-256 of each rendered card slot as
 # it stands before the producers run. The store is latest-per-card with no
@@ -85,7 +85,7 @@ BASE_TMP=""
 COMPOSE="$HERMES_SCAFFOLD/compose.yaml"
 for job in ld-morning-triage ld-morning-updates ld-weather ld-weekly-digest; do
   ssh -o StrictHostKeyChecking=accept-new -- "$LD_PI_SSH_TARGET" \
-      "docker compose -f '$COMPOSE' exec -T '$HERMES_SERVICE' hermes cron run '$job'" \
+      "docker compose -f \"$COMPOSE\" exec -T '$HERMES_SERVICE' hermes cron run '$job'" \
     || { echo "FAIL: activation run $job" >&2; exit 1; }
 done
 echo "activation runs dispatched"
