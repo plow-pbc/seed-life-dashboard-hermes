@@ -79,7 +79,7 @@ unset AGENT_TOKEN_VAL
 # `printf` is a bash builtin (`type printf` → builtin), so its argv
 # never appears in /proc/<pid>/cmdline or `ps`. The file is removed on
 # every exit path via the trap.
-CURL_CFG=$(mktemp -t umbrella-verify-curl)
+CURL_CFG=$(mktemp "${TMPDIR:-/tmp}/umbrella-verify-curl.XXXXXX")
 trap 'rm -f "$CURL_CFG"' EXIT
 chmod 600 "$CURL_CFG"
 ENDPOINT_URL=$(jq -re .endpoint_url "$UMBRELLA_STATE")
