@@ -317,7 +317,7 @@ else
     RESUMED=$(fetch_by_nonce) \
       || { echo "FAIL v-handoff: could not query chat to resume by nonce" >&2; exit 1; }
     RESUMED_UID=""; RESUMED_STATUS=""
-    IFS=$'\t' read -r RESUMED_UID RESUMED_STATUS <<<"$RESUMED" || true
+    IFS=$'\t' read -r RESUMED_UID RESUMED_STATUS <<<"$RESUMED"
     if [ -n "$RESUMED_UID" ]; then
       echo "v-handoff: recovered a prior welcome by nonce (lost POST response); resuming, not re-sending"
       MSG_UID="$RESUMED_UID"; HANDOFF_STATUS="$RESUMED_STATUS"
