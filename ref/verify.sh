@@ -208,4 +208,96 @@ while :; do
   sleep 15
 done
 
+# v-handoff: FINAL check — the owner take-over handoff. The kiosk is up and the
+# producers have run (everything above), but the install isn't "handed off" until
+# (a) Hermes is actually SUBSCRIBED to the bound chat (gateway connected — bound
+# but not subscribed means no inbound/outbound flows) and (b) a welcome message
+# has REACHED the owner's device (delivered, not merely accepted). The send is
+# once-only across re-runs: verification runs repeatedly, so it gates on
+# state.json.handoff_sent_at and never re-texts the owner. `sent` = API accepted
+# (necessary, not sufficient); `delivered`/`read` = reached the device (the bar);
+# still-`sent` after the poll window WARNs (recipient device likely offline) but
+# does NOT hard-fail. The chat bearer (PLOW_CHAT_TOKEN) travels via its own
+# mode-600 -K config, never on argv — same hygiene as the dashboard bearer above.
+GATEWAY_STATE="${SCAFFOLD_DIR%/}/data/gateway_state.json"
+[ -f "$GATEWAY_STATE" ] \
+  || { echo "FAIL v-handoff: gateway_state.json missing at $GATEWAY_STATE (chat bound but Hermes not subscribed)" >&2; exit 1; }
+[ "$(jq -r '.platforms.plow_chat.state // empty' "$GATEWAY_STATE")" = connected ] \
+  || { echo "FAIL v-handoff: plow_chat gateway not connected (chat bound but Hermes not subscribed)" >&2; exit 1; }
+
+HANDOFF_SENT_AT=$(jq -r '.handoff_sent_at // empty' "$UMBRELLA_STATE")
+if [ -n "$HANDOFF_SENT_AT" ]; then
+  echo "OK   v-handoff (already sent at $HANDOFF_SENT_AT)"
+else
+  # Read the chat credentials from the scaffold's data/.env (the producers'
+  # write-side, where seed-hermes-plow's activation landed PLOW_CHAT_*). The
+  # token is read by stripping the KEY= prefix and is NEVER echoed.
+  CHAT_TOKEN=$(grep -m1 -E '^PLOW_CHAT_TOKEN=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_TOKEN=//')
+  CHAT_BASE=$(grep -m1 -E '^PLOW_CHAT_BASE_URL=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_BASE_URL=//')
+  CHAT_BASE="${CHAT_BASE:-https://api.plow.co}"
+  CHAT_UID=$(grep -m1 -E '^PLOW_CHAT_CHAT_UID=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_CHAT_UID=//')
+  [ -n "$CHAT_TOKEN" ] \
+    || { echo "FAIL v-handoff: PLOW_CHAT_TOKEN missing from $AGENT_ENV (plow_chat not activated)" >&2; exit 1; }
+  [ -n "$CHAT_UID" ] \
+    || { echo "FAIL v-handoff: PLOW_CHAT_CHAT_UID missing from $AGENT_ENV (plow_chat not activated)" >&2; exit 1; }
+
+  # The chat bearer rides its own mode-600 -K config — argv is world-readable
+  # through /proc/<pid>/cmdline and `ps`. `printf` is a bash builtin, so the
+  # token never appears on any argv; the file is removed by the EXIT trap below.
+  CHAT_CFG=$(mktemp -t umbrella-handoff-curl)
+  trap 'rm -f "$CURL_CFG" "$CHAT_CFG"' EXIT
+  chmod 600 "$CHAT_CFG"
+  printf 'header = "Authorization: Bearer %s"\n' "$CHAT_TOKEN" > "$CHAT_CFG"
+  unset CHAT_TOKEN
+
+  HANDOFF_MSG="✅ Your Life Dashboard is live — the Pi kiosk is up and I'm connected here on Hermes. Reply anytime to chat with me."
+  POST_RESP=$(jq -nc --arg b "$HANDOFF_MSG" '{body: $b}' \
+    | curl -fsS -K "$CHAT_CFG" -H "Content-Type: application/json" \
+        --data-binary @- "$CHAT_BASE/v1/chats/$CHAT_UID/messages") \
+    || { echo "FAIL v-handoff: POST to $CHAT_BASE/v1/chats/\$CHAT_UID/messages returned non-2xx" >&2; exit 1; }
+  MSG_UID=$(printf '%s' "$POST_RESP" | jq -r '.uid // empty')
+  [ -n "$MSG_UID" ] \
+    || { echo "FAIL v-handoff: send response carried no message uid" >&2; exit 1; }
+
+  # Poll for delivery: delivered/read → PASS; still sent after 45s → WARN (not
+  # fail). On either outcome we record handoff_sent_at so a re-run never re-texts.
+  HANDOFF_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  HANDOFF_DEADLINE=$(( $(date +%s) + 45 ))
+  HANDOFF_STATUS=sent
+  while :; do
+    LIST_RESP=$(curl -fsS -K "$CHAT_CFG" "$CHAT_BASE/v1/chats/$CHAT_UID/messages" 2>/dev/null || true)
+    ST=$(printf '%s' "$LIST_RESP" \
+      | jq -r --arg u "$MSG_UID" '(.messages? // .) | (if type=="array" then . else [] end) | map(select(.uid == $u)) | .[0].status // empty' 2>/dev/null || true)
+    [ -n "$ST" ] && HANDOFF_STATUS="$ST"
+    case "$HANDOFF_STATUS" in
+      delivered|read) break ;;
+    esac
+    [ "$(date +%s)" -ge "$HANDOFF_DEADLINE" ] && break
+    sleep 5
+  done
+
+  # Record handoff_sent_at + handoff_msg_uid into the umbrella state file,
+  # preserving existing keys (jq merge, token-free read), via the same atomic
+  # mode-600 mktemp-in-STATE_DIR + rename the rendezvous mint uses.
+  HANDOFF_TMP=$(mktemp "$STATE_DIR/state.json.XXXXXX")   # mktemp creates mode 600
+  trap 'rm -f "$CURL_CFG" "$CHAT_CFG" "$HANDOFF_TMP"' EXIT
+  jq --arg ts "$HANDOFF_TS" --arg uid "$MSG_UID" \
+     '. + {handoff_sent_at: $ts, handoff_msg_uid: $uid}' "$UMBRELLA_STATE" > "$HANDOFF_TMP"
+  mv "$HANDOFF_TMP" "$UMBRELLA_STATE"
+
+  case "$HANDOFF_STATUS" in
+    delivered|read) echo "OK   v-handoff (welcome message $HANDOFF_STATUS)" ;;
+    *) echo "WARN v-handoff: welcome message still 'sent' after 45s — recipient device may be offline; recorded handoff_sent_at and continuing" >&2 ;;
+  esac
+fi
+
+# Take-over summary (human handoff). Phone numbers are masked to last-4 for
+# CI-log safety; the owner already has their full number from the delivered text.
+# The chat token never prints here.
+echo "--- handoff summary ---"
+echo "kiosk:    $ENDPOINT_URL"
+echo "Pi:       $(printf '%s' "$PI_TARGET" | sed -E 's/[0-9]{5,}([0-9]{4})/****\1/g')"
+echo "schedule: weather 06:00, affirmation 07:00, alert 07:05, digest Sun 17:00"
+echo "take over: reply to the Hermes chat thread to chat with the agent."
+
 echo "tree conforms"
