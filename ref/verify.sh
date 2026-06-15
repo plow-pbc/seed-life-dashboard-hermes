@@ -308,11 +308,16 @@ else
 
     # If a prior attempt left a nonce but no uid, the POST may have been accepted
     # while its response was lost — look the message up by nonce and resume on it
-    # rather than re-sending a duplicate.
-    # read returns non-zero on a no-trailing-newline / empty stream — that's the
-    # "no prior message" case, not an error, so don't let set -e abort on it.
+    # rather than re-sending a duplicate. Capture via command substitution so a
+    # transient GET failure (curl non-zero) FAILS LOUD here rather than falling
+    # through to a second POST — silently re-sending is exactly what the nonce
+    # exists to prevent. A successful no-match GET returns "\t" (uid+status both
+    # empty); the here-string always carries a trailing newline so the split's
+    # read never hits the EOF-non-zero path.
+    RESUMED=$(fetch_by_nonce) \
+      || { echo "FAIL v-handoff: could not query chat to resume by nonce" >&2; exit 1; }
     RESUMED_UID=""; RESUMED_STATUS=""
-    IFS=$'\t' read -r RESUMED_UID RESUMED_STATUS < <(fetch_by_nonce) || true
+    IFS=$'\t' read -r RESUMED_UID RESUMED_STATUS <<<"$RESUMED" || true
     if [ -n "$RESUMED_UID" ]; then
       echo "v-handoff: recovered a prior welcome by nonce (lost POST response); resuming, not re-sending"
       MSG_UID="$RESUMED_UID"; HANDOFF_STATUS="$RESUMED_STATUS"
