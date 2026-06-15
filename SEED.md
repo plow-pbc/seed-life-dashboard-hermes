@@ -19,6 +19,7 @@ API / per-machine state — declared as the `### Requirements` manifest below so
 | hardware | Docker host running the seed-hermes scaffold (the container running, `./data:/opt/data`) | preflight | this machine (or the host the `--scaffold` dir lives on) | |
 | hardware | Raspberry Pi over SSH (`user@host`) | preflight | LD_PI_SSH_TARGET            |                                   |
 | input    | Calendar ICS URL            | preflight | LD_ICAL_URL                 |                                   |
+| input    | Household owner display name | preflight | LD_OWNER_NAME              |                                   |
 | system   | Pi system packages (Node ≥20.6, npm, git, Chromium, emoji font) | preflight | pre-installed on the Pi (probed **up front** per [environment is probed up front](#environment-is-probed-up-front); with passwordless sudo the installer auto-runs the surfaced `apt` line, else the line is surfaced right after inputs land) | |
 | auth     | Plow Chat activation        | in-flow   | the `plow_chat` gateway's one-time phone-bind activation (satisfied by `seed-hermes-plow`'s `create_plow_chat_curl.sh`; lands `PLOW_CHAT_*` into the scaffold's `data/.env`) | PLOW_CHAT_TOKEN |
 
