@@ -267,7 +267,12 @@ else
   # message, the uid never reaches us, but the nonce did reach the chat — a
   # rerun finds the message by nonce and resumes on it instead of re-texting.
   HANDOFF_NONCE=$(jq -r '.handoff_nonce // empty' "$UMBRELLA_STATE")
-  if [ -z "$HANDOFF_NONCE" ]; then HANDOFF_NONCE=$(openssl rand -hex 8); fi
+  # Mint from /dev/urandom (no new dep — openssl is absent on minimal hosts);
+  # fail loud rather than abort bare under set -e if the read ever fails.
+  if [ -z "$HANDOFF_NONCE" ]; then
+    HANDOFF_NONCE=$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n') \
+      || { echo "FAIL v-handoff: could not mint handoff nonce from /dev/urandom" >&2; exit 1; }
+  fi
   HANDOFF_MSG="✅ Your Life Dashboard is live — the Pi kiosk is up and I'm connected here on Hermes. Reply anytime to chat with me."
 
   # state.json merge helper: atomic mode-600 (mktemp-in-STATE_DIR + rename),
@@ -298,17 +303,21 @@ else
     # POST, so a crash/lost-response between here and the uid write is still
     # recoverable by nonce on the next run.
     [ -n "$(jq -r '.handoff_nonce // empty' "$UMBRELLA_STATE")" ] \
-      || merge_state --arg n "$HANDOFF_NONCE" '. + {handoff_nonce: $n}'
+      || merge_state --arg n "$HANDOFF_NONCE" '. + {handoff_nonce: $n}' \
+      || { echo "FAIL v-handoff: could not persist handoff_nonce to state.json" >&2; exit 1; }
 
     # If a prior attempt left a nonce but no uid, the POST may have been accepted
     # while its response was lost — look the message up by nonce and resume on it
     # rather than re-sending a duplicate.
-    RESUMED=$(fetch_by_nonce)
-    RESUMED_UID="${RESUMED%%	*}"; RESUMED_STATUS="${RESUMED#*	}"
+    # read returns non-zero on a no-trailing-newline / empty stream — that's the
+    # "no prior message" case, not an error, so don't let set -e abort on it.
+    RESUMED_UID=""; RESUMED_STATUS=""
+    IFS=$'\t' read -r RESUMED_UID RESUMED_STATUS < <(fetch_by_nonce) || true
     if [ -n "$RESUMED_UID" ]; then
       echo "v-handoff: recovered a prior welcome by nonce (lost POST response); resuming, not re-sending"
       MSG_UID="$RESUMED_UID"; HANDOFF_STATUS="$RESUMED_STATUS"
-      merge_state --arg uid "$MSG_UID" '. + {handoff_msg_uid: $uid}'
+      merge_state --arg uid "$MSG_UID" '. + {handoff_msg_uid: $uid}' \
+        || { echo "FAIL v-handoff: could not persist handoff_msg_uid to state.json" >&2; exit 1; }
     else
       # No prior message in the chat — safe to send. The nonce rides the body.
       POST_RESP=$(jq -nc --arg b "$HANDOFF_MSG · ref:$HANDOFF_NONCE" '{body: $b}' \
@@ -319,7 +328,8 @@ else
       [ -n "$MSG_UID" ] \
         || { echo "FAIL v-handoff: send response carried no message uid — a rerun resumes by nonce (no re-send)" >&2; exit 1; }
       # Persist the uid NOW so a crash before the delivery confirm resumes here.
-      merge_state --arg uid "$MSG_UID" '. + {handoff_msg_uid: $uid}'
+      merge_state --arg uid "$MSG_UID" '. + {handoff_msg_uid: $uid}' \
+        || { echo "FAIL v-handoff: could not persist handoff_msg_uid to state.json" >&2; exit 1; }
     fi
   fi
 
@@ -331,7 +341,9 @@ else
   HANDOFF_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   HANDOFF_DEADLINE=$(( $(date +%s) + 45 ))
   while :; do
-    case "$HANDOFF_STATUS" in delivered|read) break ;; esac
+    # A status already resolved by the nonce-resume above (success OR terminal
+    # failure) short-circuits the poll — no point waiting 45s on a settled state.
+    case "$HANDOFF_STATUS" in delivered|read|failed|undeliverable) break ;; esac
     LIST_RESP=$(curl -fsS -K "$CURL_CFG" "$CHAT_BASE/v1/chats/$CHAT_UID/messages") \
       || { echo "FAIL v-handoff: delivery-poll GET failed for $CHAT_BASE/v1/chats/\$CHAT_UID/messages" >&2; exit 1; }
     printf '%s' "$LIST_RESP" | jq -e . >/dev/null 2>&1 \
@@ -356,7 +368,8 @@ else
   case "$HANDOFF_STATUS" in
     delivered|read)
       # Atomic mode-600 merge, existing keys preserved.
-      merge_state --arg ts "$HANDOFF_TS" '. + {handoff_sent_at: $ts}'
+      merge_state --arg ts "$HANDOFF_TS" '. + {handoff_sent_at: $ts}' \
+        || { echo "FAIL v-handoff: could not persist handoff_sent_at to state.json" >&2; exit 1; }
       echo "OK   v-handoff (welcome message $HANDOFF_STATUS)" ;;
     sent)
       # Device likely offline. handoff_msg_uid stays persisted, handoff_sent_at
