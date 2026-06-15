@@ -239,7 +239,7 @@ else
   # (no userinfo/path/query/fragment) so a malformed or downgraded value can't
   # steer PLOW_CHAT_TOKEN off the intended host.
   [[ "$CHAT_BASE" =~ ^https://[A-Za-z0-9._-]+(:[0-9]+)?$ ]] \
-    || { echo "FAIL v-handoff: PLOW_CHAT_BASE_URL must be a bare https origin (no userinfo/path/query/fragment): $CHAT_BASE" >&2; exit 1; }
+    || { echo "FAIL v-handoff: PLOW_CHAT_BASE_URL must be a bare https origin (no userinfo/path/query/fragment) — check that value in data/.env" >&2; exit 1; }
   CHAT_UID=$(grep -m1 -E '^PLOW_CHAT_CHAT_UID=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_CHAT_UID=//')
   [ -n "$CHAT_TOKEN" ] \
     || { echo "FAIL v-handoff: PLOW_CHAT_TOKEN missing from $AGENT_ENV (plow_chat not activated)" >&2; exit 1; }
@@ -300,25 +300,22 @@ else
   [ -n "$HANDOFF_STATUS" ] \
     || { echo "FAIL v-handoff: delivery status never observed for message $MSG_UID within 45s (message not found in chat)" >&2; exit 1; }
 
-  # Classify the observed status BEFORE recording handoff_sent_at. Only an
-  # offline 'sent' earns the non-fatal WARN; a terminal failure status
-  # (failed/undeliverable/…) must NOT be blessed as handed-off — fail loud and
-  # leave handoff_sent_at unset so a rerun re-checks (handoff_msg_uid is already
-  # persisted, so the rerun resumes polling, never re-sends).
+  # handoff_sent_at (the once-only latch) is written ONLY on a true delivery
+  # (delivered/read). An offline 'sent' WARNs but does NOT latch — latching it
+  # would calcify a never-delivered "complete" state and skip every future
+  # check; instead handoff_msg_uid (already persisted) lets the next run resume
+  # polling THIS message until it delivers or terminally fails. A terminal
+  # failure status fails loud. None of these branches re-send.
   case "$HANDOFF_STATUS" in
-    delivered|read|sent) : ;;
-    *) echo "FAIL v-handoff: welcome message has terminal status '$HANDOFF_STATUS' — not delivered" >&2; exit 1 ;;
-  esac
-
-  # Record handoff_sent_at (the uid is already persisted above). Atomic mode-600
-  # merge, preserving existing keys.
-  HS_TMP=$(mktemp "$STATE_DIR/state.json.XXXXXX")   # mktemp creates mode 600
-  trap 'rm -f "$CURL_CFG" "$HS_TMP"' EXIT
-  jq --arg ts "$HANDOFF_TS" '. + {handoff_sent_at: $ts}' "$UMBRELLA_STATE" > "$HS_TMP" && mv "$HS_TMP" "$UMBRELLA_STATE"
-
-  case "$HANDOFF_STATUS" in
-    delivered|read) echo "OK   v-handoff (welcome message $HANDOFF_STATUS)" ;;
-    sent) echo "WARN v-handoff: welcome message still 'sent' after 45s — recipient device may be offline; recorded handoff_sent_at and continuing" >&2 ;;
+    delivered|read)
+      HS_TMP=$(mktemp "$STATE_DIR/state.json.XXXXXX")   # mktemp creates mode 600
+      trap 'rm -f "$CURL_CFG" "$HS_TMP"' EXIT
+      jq --arg ts "$HANDOFF_TS" '. + {handoff_sent_at: $ts}' "$UMBRELLA_STATE" > "$HS_TMP" && mv "$HS_TMP" "$UMBRELLA_STATE"
+      echo "OK   v-handoff (welcome message $HANDOFF_STATUS)" ;;
+    sent)
+      echo "WARN v-handoff: welcome message still 'sent' after 45s — recipient device may be offline; left handoff_sent_at unset so a later verification re-checks the same message (no re-send)" >&2 ;;
+    *)
+      echo "FAIL v-handoff: welcome message has terminal status '$HANDOFF_STATUS' — not delivered" >&2; exit 1 ;;
   esac
 fi
 
