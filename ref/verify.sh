@@ -4,12 +4,14 @@
 # Reads the umbrella's own state file as the source of truth for the
 # bearer and the endpoint, then compares (a) the producers' DASHBOARD_TOKEN
 # value as written into the seed-hermes scaffold's data/.env (the agent
-# seed writes the RHS verbatim; see SEED.md ## Verification step 2), and
-# (b) the Pi's .env DASHBOARD_TOKEN via SHA-256 hash over SSH (so the value
-# never lands on the local terminal). Finally, runs an end-to-end smoke from
-# the Docker host directly to the Pi's published /api/message (proving
-# host→Pi reachability) and back out via the Pi's localhost API (the same
-# store the kiosk reads), using the fixed, non-rendered probe card
+# seed writes the RHS verbatim; see SEED.md ## Verification step 2) and
+# (b) the Pi's viewer .env DASHBOARD_TOKEN — BOTH via SHA-256 hash over SSH,
+# because in the Pi-colocated topology the scaffold lives ON THE PI (the
+# container and the viewer share one machine), so neither token value lands
+# on the install host's terminal. Finally, runs an end-to-end smoke from the
+# install host directly to the Pi's published /api/message (proving
+# install-host→Pi reachability) and back out via the Pi's localhost API (the
+# same store the kiosk reads), using the fixed, non-rendered probe card
 # __umbrella_verify__ — the store is latest-per-card with no DELETE route,
 # so a fixed card keeps it bounded at one inert probe field; per-run
 # uniqueness lives in the text.
@@ -22,9 +24,11 @@
 set -euo pipefail
 
 # The seed-hermes scaffold dir holds the producers' data/.env (agent-side
-# token write-side). Default ./hermes-agent; overridable via --scaffold or
-# HERMES_SCAFFOLD, mirroring the agent seed's installer + verifier.
-SCAFFOLD_DIR="${HERMES_SCAFFOLD:-./hermes-agent}"
+# token write-side). In the Pi-colocated topology the scaffold lives ON THE
+# PI, inside the seed-hermes clone; HERMES_SCAFFOLD (or --scaffold) is that
+# on-Pi path, default ${SEED_HOME:-$HOME/seeds}/seed-hermes/hermes-agent —
+# resolved on the Pi, not locally. Mirrors the agent seed's installer.
+SCAFFOLD_DIR="${HERMES_SCAFFOLD:-\${SEED_HOME:-\$HOME/seeds}/seed-hermes/hermes-agent}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --scaffold) SCAFFOLD_DIR="$2"; shift 2 ;;
@@ -41,39 +45,53 @@ STATE_DIR="${SEED_LD_HERMES_STATE_DIR:-$HOME/.local/state/seed-life-dashboard-he
 UMBRELLA_STATE="$STATE_DIR/state.json"
 
 [ -f "$UMBRELLA_STATE" ] || { echo "FAIL v-link: umbrella state missing at $UMBRELLA_STATE" >&2; exit 1; }
-[ -f "$AGENT_ENV" ] || { echo "FAIL v-link: scaffold data/.env missing at $AGENT_ENV" >&2; exit 1; }
 
 PI_TARGET=$(jq -re .pi_ssh_target "$UMBRELLA_STATE")
 
+# The scaffold data/.env now lives on the Pi; existence is checked there
+# (the on-Pi path may reference $HOME/$SEED_HOME, so it expands on the Pi).
+ssh $SSH_OPTS -- "$PI_TARGET" "[ -f \"$AGENT_ENV\" ]" \
+  || { echo "FAIL v-link: scaffold data/.env missing on Pi at $AGENT_ENV" >&2; exit 1; }
+
 # v-children: every declared child SEED's install terminated `success`.
-# Each child's install-report.json lives at its $REPO_ROOT — the installer
-# cache for the host-side children (durable-ssh, hermes-plow, hermes-agent),
-# the Pi's cache for the viewer (cloned there per the remote-host transport
-# contract). The Pi check parses with node (jq is not in the viewer's
+# Each child's install-report.json lives at its $REPO_ROOT. In the
+# Pi-colocated topology only seed-durable-ssh installs on the install host;
+# seed-hermes, seed-hermes-plow, the agent, and the viewer are all
+# remote-host deps cloned in the PI's cache (per the remote-host transport
+# contract). The Pi checks parse with node (jq is not in the Pi's
 # system-package set; node >=20.6 is), so both transports assert the same
 # top-level-key predicate.
 CHILD_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/seed/github.com/plow-pbc"
-for child in seed-durable-ssh seed-hermes-plow seed-life-dashboard-hermes-agent; do
-  R="$CHILD_CACHE/$child/install-report.json"
-  [ "$(jq -r .terminal_reason "$R" 2>/dev/null)" = success ] \
-    || { echo "FAIL v-children: $child terminal_reason != success, or report unreadable (expected: $R)" >&2; exit 1; }
+R="$CHILD_CACHE/seed-durable-ssh/install-report.json"
+[ "$(jq -r .terminal_reason "$R" 2>/dev/null)" = success ] \
+  || { echo "FAIL v-children: seed-durable-ssh terminal_reason != success, or report unreadable (expected: $R)" >&2; exit 1; }
+for child in seed-hermes seed-hermes-plow seed-life-dashboard-hermes-agent seed-life-dashboard-viewer; do
+  # The child name is passed as a positional arg ($0 to the remote bash -c),
+  # not interpolated into the quoted body — same positional discipline as the
+  # node `process.argv[1]` read, so no nested-escaping fragility.
+  ssh $SSH_OPTS -- "$PI_TARGET" 'bash -l -c '\''node -e "process.exit(JSON.parse(require(\"fs\").readFileSync(process.argv[1])).terminal_reason===\"success\"?0:1)" "${XDG_CACHE_HOME:-$HOME/.cache}/seed/github.com/plow-pbc/$0/install-report.json"'\'' '"$child" \
+    || { echo "FAIL v-children: $child terminal_reason != success, or report unreadable over SSH (Pi cache clone)" >&2; exit 1; }
 done
-ssh $SSH_OPTS -- "$PI_TARGET" 'bash -l -c '\''node -e "process.exit(JSON.parse(require(\"fs\").readFileSync(process.argv[1])).terminal_reason===\"success\"?0:1)" "${XDG_CACHE_HOME:-$HOME/.cache}/seed/github.com/plow-pbc/seed-life-dashboard-viewer/install-report.json"'\''' \
-  || { echo "FAIL v-children: viewer terminal_reason != success, or report unreadable over SSH (Pi cache clone)" >&2; exit 1; }
 echo "OK   v-children"
 
 # v-link-agent: the producers' DASHBOARD_TOKEN (the RHS in the scaffold's
-# data/.env) == umbrella's state.json:dashboard_token. The value is read by
-# stripping the KEY= prefix and never echoed.
+# data/.env, ON THE PI) == umbrella's state.json:dashboard_token. The Pi-side
+# value is hashed on the Pi and only its SHA-256 returns — the token value
+# never lands on the install host's terminal (matching v-link-viewer below).
 STATE_TOKEN=$(jq -re .dashboard_token "$UMBRELLA_STATE")
-AGENT_TOKEN_VAL=$(grep -m1 -E '^DASHBOARD_TOKEN=' "$AGENT_ENV" | sed 's/^DASHBOARD_TOKEN=//')
-if [ "$STATE_TOKEN" = "$AGENT_TOKEN_VAL" ]; then
+STATE_SHA=$(printf '%s' "$STATE_TOKEN" | shasum -a 256 | awk '{print $1}')
+# AGENT_ENV may reference $HOME/$SEED_HOME; the remote login shell expands it
+# (the path is interpolated into the double-quoted remote command, so any
+# $HOME inside it expands ON THE PI, matching the existence check above). The
+# token value is hashed on the Pi; only the SHA-256 returns — the value never
+# lands on the install host's terminal (same discipline as v-link-viewer).
+AGENT_SHA=$(ssh $SSH_OPTS -- "$PI_TARGET" "bash -lc 'VAL=\$(grep -m1 \"^DASHBOARD_TOKEN=\" \"$AGENT_ENV\" | sed \"s/^DASHBOARD_TOKEN=//\"); printf %s \"\$VAL\" | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | awk \"{print \\\$1}\"'")
+if [ "$STATE_SHA" = "$AGENT_SHA" ]; then
   echo "OK   v-link-agent"
 else
-  echo "FAIL v-link-agent: scaffold data/.env DASHBOARD_TOKEN does not match umbrella state token" >&2
+  echo "FAIL v-link-agent: scaffold data/.env DASHBOARD_TOKEN (on Pi) does not match umbrella state token" >&2
   exit 1
 fi
-unset AGENT_TOKEN_VAL
 
 # Build a mode-600 curl config file carrying the Authorization header.
 # `printf` is a bash builtin (`type printf` → builtin), so its argv
@@ -86,7 +104,7 @@ ENDPOINT_URL=$(jq -re .endpoint_url "$UMBRELLA_STATE")
 printf 'header = "Authorization: Bearer %s"\n' "$STATE_TOKEN" > "$CURL_CFG"
 
 # v-link-viewer: Pi's .env DASHBOARD_TOKEN value SHA-256 matches umbrella's.
-STATE_SHA=$(printf '%s' "$STATE_TOKEN" | shasum -a 256 | awk '{print $1}')
+# STATE_SHA was computed at v-link-agent above (same umbrella token).
 PI_SHA=$(ssh $SSH_OPTS -- "$PI_TARGET" bash -s <<'REMOTE'
 set -euo pipefail
 VAL=$(grep '^DASHBOARD_TOKEN=' "$HOME/services/life-dashboard-viewer/.env" | sed 's/^DASHBOARD_TOKEN=//')
@@ -102,7 +120,7 @@ else
   exit 1
 fi
 
-# v-e2e: synthetic POST from the Docker host directly to the Pi's published
+# v-e2e: synthetic POST from the install host directly to the Pi's published
 # endpoint; Pi GET via localhost (filtered to the same card) → assert the
 # sentinel round-trips. The probe CARD is the FIXED `__umbrella_verify__`:
 # the store is latest-per-card with no DELETE route (any non-GET/POST is
