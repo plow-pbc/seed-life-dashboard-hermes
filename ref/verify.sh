@@ -229,9 +229,8 @@ HANDOFF_SENT_AT=$(jq -r '.handoff_sent_at // empty' "$UMBRELLA_STATE")
 if [ -n "$HANDOFF_SENT_AT" ]; then
   echo "OK   v-handoff (already sent at $HANDOFF_SENT_AT)"
 else
-  # Read the chat credentials from the scaffold's data/.env (the producers'
-  # write-side, where seed-hermes-plow's activation landed PLOW_CHAT_*). The
-  # token is read by stripping the KEY= prefix and is NEVER echoed.
+  # Chat creds from the scaffold's data/.env (where seed-hermes-plow's
+  # activation landed PLOW_CHAT_*). Token read by stripping KEY=, NEVER echoed.
   CHAT_TOKEN=$(grep -m1 -E '^PLOW_CHAT_TOKEN=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_TOKEN=//')
   CHAT_BASE=$(grep -m1 -E '^PLOW_CHAT_BASE_URL=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_BASE_URL=//')
   CHAT_BASE="${CHAT_BASE:-https://api.plow.co}"
@@ -241,33 +240,50 @@ else
   [ -n "$CHAT_UID" ] \
     || { echo "FAIL v-handoff: PLOW_CHAT_CHAT_UID missing from $AGENT_ENV (plow_chat not activated)" >&2; exit 1; }
 
-  # The chat bearer rides its own mode-600 -K config — argv is world-readable
-  # through /proc/<pid>/cmdline and `ps`. `printf` is a bash builtin, so the
-  # token never appears on any argv; the file is removed by the EXIT trap below.
-  CHAT_CFG=$(mktemp "${TMPDIR:-/tmp}/umbrella-handoff-curl.XXXXXX")
-  trap 'rm -f "$CURL_CFG" "$CHAT_CFG"' EXIT
-  chmod 600 "$CHAT_CFG"
-  printf 'header = "Authorization: Bearer %s"\n' "$CHAT_TOKEN" > "$CHAT_CFG"
+  # Reuse the existing mode-600 $CURL_CFG seam — the e2e smoke above is done
+  # with it, so overwrite it with the chat bearer rather than maintaining a
+  # second config + trap. The bearer never hits argv (printf is a builtin);
+  # the EXIT trap set at $CURL_CFG's creation already removes it.
+  printf 'header = "Authorization: Bearer %s"\n' "$CHAT_TOKEN" > "$CURL_CFG"
   unset CHAT_TOKEN
 
-  HANDOFF_MSG="✅ Your Life Dashboard is live — the Pi kiosk is up and I'm connected here on Hermes. Reply anytime to chat with me."
-  POST_RESP=$(jq -nc --arg b "$HANDOFF_MSG" '{body: $b}' \
-    | curl -fsS -K "$CHAT_CFG" -H "Content-Type: application/json" \
-        --data-binary @- "$CHAT_BASE/v1/chats/$CHAT_UID/messages") \
-    || { echo "FAIL v-handoff: POST to $CHAT_BASE/v1/chats/\$CHAT_UID/messages returned non-2xx" >&2; exit 1; }
-  MSG_UID=$(printf '%s' "$POST_RESP" | jq -r '.uid // empty')
-  [ -n "$MSG_UID" ] \
-    || { echo "FAIL v-handoff: send response carried no message uid" >&2; exit 1; }
+  # Resume-safe once-only: sending is the only non-idempotent step, so its uid
+  # is persisted to state.json the instant the POST returns — before the poll.
+  # A rerun that finds handoff_msg_uid (but no handoff_sent_at — a prior run
+  # crashed mid-poll) RESUMES polling that message instead of sending a second.
+  MSG_UID=$(jq -r '.handoff_msg_uid // empty' "$UMBRELLA_STATE")
+  if [ -z "$MSG_UID" ]; then
+    HANDOFF_MSG="✅ Your Life Dashboard is live — the Pi kiosk is up and I'm connected here on Hermes. Reply anytime to chat with me."
+    POST_RESP=$(jq -nc --arg b "$HANDOFF_MSG" '{body: $b}' \
+      | curl -fsS -K "$CURL_CFG" -H "Content-Type: application/json" \
+          --data-binary @- "$CHAT_BASE/v1/chats/$CHAT_UID/messages") \
+      || { echo "FAIL v-handoff: POST to $CHAT_BASE/v1/chats/\$CHAT_UID/messages returned non-2xx" >&2; exit 1; }
+    MSG_UID=$(printf '%s' "$POST_RESP" | jq -r '.uid // empty')
+    [ -n "$MSG_UID" ] \
+      || { echo "FAIL v-handoff: send response carried no message uid" >&2; exit 1; }
+    # Persist the uid NOW (atomic mode-600 merge) so a crash before the delivery
+    # confirm can never re-text — the rerun resumes on this uid.
+    HU_TMP=$(mktemp "$STATE_DIR/state.json.XXXXXX")
+    trap 'rm -f "$CURL_CFG" "$HU_TMP"' EXIT
+    jq --arg uid "$MSG_UID" '. + {handoff_msg_uid: $uid}' "$UMBRELLA_STATE" > "$HU_TMP" && mv "$HU_TMP" "$UMBRELLA_STATE"
+  else
+    echo "v-handoff: resuming delivery poll for a previously-sent message (no re-send)"
+  fi
 
-  # Poll for delivery: delivered/read → PASS; still sent after 45s → WARN (not
-  # fail). On either outcome we record handoff_sent_at so a re-run never re-texts.
+  # Poll for delivery. A GET failure or an unparseable response is FAIL-loud —
+  # never silently treated as 'sent'. HANDOFF_STATUS starts empty and only ever
+  # holds an *observed* status, so an undeliverable/never-listed message FAILs
+  # rather than masquerading as a benign WARN.
   HANDOFF_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   HANDOFF_DEADLINE=$(( $(date +%s) + 45 ))
-  HANDOFF_STATUS=sent
+  HANDOFF_STATUS=""
   while :; do
-    LIST_RESP=$(curl -fsS -K "$CHAT_CFG" "$CHAT_BASE/v1/chats/$CHAT_UID/messages" 2>/dev/null || true)
+    LIST_RESP=$(curl -fsS -K "$CURL_CFG" "$CHAT_BASE/v1/chats/$CHAT_UID/messages") \
+      || { echo "FAIL v-handoff: delivery-poll GET failed for $CHAT_BASE/v1/chats/\$CHAT_UID/messages" >&2; exit 1; }
+    printf '%s' "$LIST_RESP" | jq -e . >/dev/null 2>&1 \
+      || { echo "FAIL v-handoff: delivery-poll response was not valid JSON" >&2; exit 1; }
     ST=$(printf '%s' "$LIST_RESP" \
-      | jq -r --arg u "$MSG_UID" '(.messages? // .) | (if type=="array" then . else [] end) | map(select(.uid == $u)) | .[0].status // empty' 2>/dev/null || true)
+      | jq -r --arg u "$MSG_UID" '(.messages? // .) | (if type=="array" then . else [] end) | map(select(.uid == $u)) | .[0].status // empty')
     [ -n "$ST" ] && HANDOFF_STATUS="$ST"
     case "$HANDOFF_STATUS" in
       delivered|read) break ;;
@@ -275,15 +291,14 @@ else
     [ "$(date +%s)" -ge "$HANDOFF_DEADLINE" ] && break
     sleep 5
   done
+  [ -n "$HANDOFF_STATUS" ] \
+    || { echo "FAIL v-handoff: delivery status never observed for message $MSG_UID within 45s (message not found in chat)" >&2; exit 1; }
 
-  # Record handoff_sent_at + handoff_msg_uid into the umbrella state file,
-  # preserving existing keys (jq merge, token-free read), via the same atomic
-  # mode-600 mktemp-in-STATE_DIR + rename the rendezvous mint uses.
-  HANDOFF_TMP=$(mktemp "$STATE_DIR/state.json.XXXXXX")   # mktemp creates mode 600
-  trap 'rm -f "$CURL_CFG" "$CHAT_CFG" "$HANDOFF_TMP"' EXIT
-  jq --arg ts "$HANDOFF_TS" --arg uid "$MSG_UID" \
-     '. + {handoff_sent_at: $ts, handoff_msg_uid: $uid}' "$UMBRELLA_STATE" > "$HANDOFF_TMP"
-  mv "$HANDOFF_TMP" "$UMBRELLA_STATE"
+  # Record handoff_sent_at (the uid is already persisted above). Atomic mode-600
+  # merge, preserving existing keys.
+  HS_TMP=$(mktemp "$STATE_DIR/state.json.XXXXXX")   # mktemp creates mode 600
+  trap 'rm -f "$CURL_CFG" "$HS_TMP"' EXIT
+  jq --arg ts "$HANDOFF_TS" '. + {handoff_sent_at: $ts}' "$UMBRELLA_STATE" > "$HS_TMP" && mv "$HS_TMP" "$UMBRELLA_STATE"
 
   case "$HANDOFF_STATUS" in
     delivered|read) echo "OK   v-handoff (welcome message $HANDOFF_STATUS)" ;;

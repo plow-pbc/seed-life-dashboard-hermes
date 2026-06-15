@@ -106,7 +106,9 @@ echo "activation runs dispatched"
   "pi_ssh_target": "user@host",
   "endpoint_url": "http://<host>:5174",
   "dashboard_token": "<hex>",
-  "installed_at": "<RFC3339-ts>"
+  "installed_at": "<RFC3339-ts>",
+  "handoff_sent_at": "<RFC3339-ts; added by Verification step 7 once the owner welcome is delivered>",
+  "handoff_msg_uid": "<Plow message uid; the durable once-only key — set the instant the welcome POSTs, before delivery is confirmed>"
 }
 ```
 
@@ -163,11 +165,24 @@ export DASHBOARD_ENDPOINT_URL="$ENDPOINT_URL/api/message"
 # write is atomic (mktemp inside STATE_DIR + rename): an interrupted run
 # can never truncate an existing source-of-truth token.
 mkdir -p "$STATE_DIR"
+# Preserve any post-handoff keys a prior install wrote (handoff_sent_at /
+# handoff_msg_uid — the Verification step 7 once-only gate); re-minting the base
+# fields must NOT drop them or a re-install re-texts the owner. They are
+# non-secret (a timestamp + a message uid), so they ride --arg — the bearer
+# still reaches jq only via env.DASHBOARD_TOKEN, never argv.
+PRIOR_HSA=""; PRIOR_HMU=""
+if [ -f "$STATE" ]; then
+  PRIOR_HSA=$(jq -r '.handoff_sent_at // empty' "$STATE")
+  PRIOR_HMU=$(jq -r '.handoff_msg_uid // empty' "$STATE")
+fi
 TMP=$(mktemp "$STATE_DIR/state.json.XXXXXX")   # mktemp creates mode 600
 trap 'rm -f "$TMP"' EXIT   # pre-rename failure (jq error, signal) cleans its orphan; SIGKILL/power-loss residue stays mode-600 and inert
 jq -n --arg pi "$LD_PI_SSH_TARGET" --arg ep "$ENDPOINT_URL" \
    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-   '{pi_ssh_target: $pi, endpoint_url: $ep, dashboard_token: env.DASHBOARD_TOKEN, installed_at: $ts}' \
+   --arg hsa "$PRIOR_HSA" --arg hmu "$PRIOR_HMU" \
+   '{pi_ssh_target: $pi, endpoint_url: $ep, dashboard_token: env.DASHBOARD_TOKEN, installed_at: $ts}
+    + (if $hsa != "" then {handoff_sent_at: $hsa} else {} end)
+    + (if $hmu != "" then {handoff_msg_uid: $hmu} else {} end)' \
    > "$TMP"
 mv "$TMP" "$STATE"
 ```
