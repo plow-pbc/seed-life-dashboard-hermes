@@ -4,7 +4,7 @@
 # Reads the umbrella's own state file as the source of truth for the
 # bearer and the endpoint, then compares (a) the producers' DASHBOARD_TOKEN
 # value as written into the seed-hermes scaffold's data/.env (the agent
-# seed writes the RHS verbatim; see SEED.md ## Verification step 2), and
+# seed writes the RHS verbatim; see SEED.md ## Verification step 3), and
 # (b) the Pi's .env DASHBOARD_TOKEN via SHA-256 hash over SSH (so the value
 # never lands on the local terminal). Finally, runs an end-to-end smoke from
 # the Docker host directly to the Pi's published /api/message (proving
