@@ -55,8 +55,8 @@ UMBRELLA_STATE="$STATE_DIR/state.json"
 # preflight probe asserts — re-checked here as a verification gate so it
 # surfaces directly, not as a downstream 600s v-populated timeout.)
 HERMES_SERVICE="${HERMES_SERVICE:-hermes-agent}"
-docker compose -f "${SCAFFOLD_DIR%/}/compose.yaml" exec -T "$HERMES_SERVICE" true >/dev/null 2>&1 \
-  || { echo "FAIL v-scaffold-exec: seed-hermes scaffold container at ${SCAFFOLD_DIR%/} is not running or not exec-able (\`docker compose exec\` failed). If it is up but the image is arm64 under qemu on an x86_64 host, the qemu binfmt handler was likely deregistered after boot — re-register with: docker run --privileged --rm tonistiigi/binfmt --install all" >&2; exit 1; }
+EXEC_ERR=$(docker compose -f "${SCAFFOLD_DIR%/}/compose.yaml" exec -T "$HERMES_SERVICE" true 2>&1) \
+  || { echo "FAIL v-scaffold-exec: seed-hermes scaffold container at ${SCAFFOLD_DIR%/} is not running or not exec-able (docker: ${EXEC_ERR}). If it is up but the image is arm64 under qemu on an x86_64 host, the qemu binfmt handler was likely deregistered after boot — re-register with: docker run --privileged --rm tonistiigi/binfmt --install all" >&2; exit 1; }
 echo "OK   v-scaffold-exec"
 
 PI_TARGET=$(jq -re .pi_ssh_target "$UMBRELLA_STATE")
