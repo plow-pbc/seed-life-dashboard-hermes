@@ -294,29 +294,25 @@ else
   HANDOFF_RESULT=$(ssh $SSH_OPTS -- "$PI_TARGET" "AGENT_ENV=\"$AGENT_ENV\" MSG_UID=\"$MSG_UID\" bash -s" <<'REMOTE'
 set -euo pipefail
 TOKEN=$(grep -m1 -E '^PLOW_CHAT_TOKEN=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_TOKEN=//')
-BASE=$(grep -m1 -E '^PLOW_CHAT_BASE_URL=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_BASE_URL=//' || true)
-BASE="${BASE:-https://api.plow.co}"
 CUID=$(grep -m1 -E '^PLOW_CHAT_CHAT_UID=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_CHAT_UID=//')
 [ -n "$TOKEN" ] || { echo "ERR PLOW_CHAT_TOKEN missing on Pi (plow_chat not activated)"; exit 1; }
 [ -n "$CUID" ]  || { echo "ERR PLOW_CHAT_CHAT_UID missing on Pi (plow_chat not activated)"; exit 1; }
-# The base carries the bearer on every request — require a bare https origin so
-# a malformed/downgraded value can't steer the token off-host (name var only).
-[[ "$BASE" =~ ^https://[A-Za-z0-9._-]+(:[0-9]+)?$ ]] \
-  || { echo "ERR PLOW_CHAT_BASE_URL is not a bare https origin (check data/.env)"; exit 1; }
+# Plow Chat API base is the prod origin, inlined: single-operator pre-PMF, no
+# second origin exists — so there's no PLOW_CHAT_BASE_URL knob to read/validate.
 # Bearer via a mode-600 -K config (never on argv); removed on exit.
 cfg=$(mktemp); chmod 600 "$cfg"; trap 'rm -f "$cfg"' EXIT
 printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$cfg"
 msg_uid="$MSG_UID"
 if [ -z "$msg_uid" ]; then
   body=$(node -e 'process.stdout.write(JSON.stringify({body:"✅ Your Life Dashboard is live — the Pi kiosk is up and I'\''m connected here on Hermes. Reply anytime to chat with me."}))')
-  resp=$(printf '%s' "$body" | curl -fsS -K "$cfg" -H "Content-Type: application/json" --data-binary @- "$BASE/v1/chats/$CUID/messages") \
+  resp=$(printf '%s' "$body" | curl -fsS -K "$cfg" -H "Content-Type: application/json" --data-binary @- "https://api.plow.co/v1/chats/$CUID/messages") \
     || { echo "ERR welcome POST returned non-2xx"; exit 1; }
   msg_uid=$(printf '%s' "$resp" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).uid||"")}catch(e){}})')
   [ -n "$msg_uid" ] || { echo "ERR welcome response carried no message uid"; exit 1; }
 fi
 deadline=$(( $(date +%s) + 45 )); status=""
 while :; do
-  resp=$(curl -fsS -K "$cfg" "$BASE/v1/chats/$CUID/messages") || { echo "ERR delivery-poll GET failed"; exit 1; }
+  resp=$(curl -fsS -K "$cfg" "https://api.plow.co/v1/chats/$CUID/messages") || { echo "ERR delivery-poll GET failed"; exit 1; }
   st=$(printf '%s' "$resp" | MU="$msg_uid" node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let j;try{j=JSON.parse(s)}catch(e){process.exit(2)}const a=Array.isArray(j)?j:(j.messages||[]);const m=a.find(x=>x&&x.uid===process.env.MU);process.stdout.write(m&&m.status?m.status:"")})') \
     || { echo "ERR delivery-poll response was not valid JSON"; exit 1; }
   [ -n "$st" ] && status="$st"
