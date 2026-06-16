@@ -214,10 +214,12 @@ done
 # but not subscribed means no inbound/outbound flows) and (b) a welcome message
 # has REACHED the owner's device (delivered, not merely accepted). The send is
 # once-only across re-runs: verification runs repeatedly, so it gates on
-# state.json.handoff_sent_at and never re-texts the owner. The welcome carries a
-# per-handoff nonce persisted BEFORE the POST, so a lost POST response (server
-# accepted, reply dropped) is recoverable: a rerun finds the message by nonce
-# and resumes polling it instead of re-sending. `sent` = API accepted
+# state.json.handoff_sent_at and never re-texts the owner. handoff_msg_uid is
+# persisted the instant the POST returns, so a crash before the delivery confirm
+# resumes polling that message instead of re-sending. (The narrow lost-POST-
+# *response* window — server accepted, reply dropped before the uid reached us —
+# may re-text once on the next run; that's an accepted trade-off for a one-time
+# best-effort notification, not worth a nonce + chat-search.) `sent` = API accepted
 # (necessary, not sufficient); `delivered`/`read` = reached the device (the bar
 # that writes handoff_sent_at). A still-`sent` after the poll window WARNs
 # (recipient device likely offline) WITHOUT writing handoff_sent_at — the uid
@@ -262,93 +264,47 @@ else
   printf 'header = "Authorization: Bearer %s"\n' "$CHAT_TOKEN" > "$CURL_CFG"
   unset CHAT_TOKEN
 
-  # The welcome body carries a per-handoff nonce so a lost-response POST is
-  # recoverable: if curl drops the reply *after* the server accepted the
-  # message, the uid never reaches us, but the nonce did reach the chat — a
-  # rerun finds the message by nonce and resumes on it instead of re-texting.
-  HANDOFF_NONCE=$(jq -r '.handoff_nonce // empty' "$UMBRELLA_STATE")
-  # Mint from /dev/urandom (no new dep — openssl is absent on minimal hosts);
-  # fail loud rather than abort bare under set -e if the read ever fails.
-  if [ -z "$HANDOFF_NONCE" ]; then
-    HANDOFF_NONCE=$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n') \
-      || { echo "FAIL v-handoff: could not mint handoff nonce from /dev/urandom" >&2; exit 1; }
-  fi
   HANDOFF_MSG="✅ Your Life Dashboard is live — the Pi kiosk is up and I'm connected here on Hermes. Reply anytime to chat with me."
 
   # state.json merge helper: atomic mode-600 (mktemp-in-STATE_DIR + rename),
-  # existing keys preserved. The pre-send marker, the resolved uid, and the
-  # final handoff_sent_at all land through here. Self-cleaning: a jq failure
-  # removes its own orphan tmp; the EXIT trap (line 83) still owns $CURL_CFG.
+  # existing keys preserved, fail-loud (a jq failure removes its orphan tmp and
+  # returns non-zero). The EXIT trap (line 83) still owns $CURL_CFG.
   merge_state() {
     local tmp; tmp=$(mktemp "$STATE_DIR/state.json.XXXXXX")   # mode 600
     if jq "$@" "$UMBRELLA_STATE" > "$tmp"; then mv "$tmp" "$UMBRELLA_STATE"; else rm -f "$tmp"; return 1; fi
   }
 
-  # Look up our welcome by nonce embedded in the body, returning its uid+status.
-  # Tolerant of either {messages:[…]} or a bare […] response shape.
-  fetch_by_nonce() {
-    curl -fsS -K "$CURL_CFG" "$CHAT_BASE/v1/chats/$CHAT_UID/messages" 2>/dev/null \
-      | jq -r --arg n "$HANDOFF_NONCE" \
-          '(.messages? // .) | (if type=="array" then . else [] end)
-           | map(select((.body // "") | contains($n))) | .[0] | "\(.uid // "")\t\(.status // "")"' 2>/dev/null
-  }
-
+  # Once-only: if a prior run already POSTed (handoff_msg_uid persisted) but
+  # never confirmed delivery (no handoff_sent_at — a crash mid-poll), resume by
+  # polling that message instead of sending a second one. The POST is the only
+  # non-idempotent step, so its uid is persisted the instant it returns.
   MSG_UID=$(jq -r '.handoff_msg_uid // empty' "$UMBRELLA_STATE")
-  HANDOFF_STATUS=""
   if [ -n "$MSG_UID" ]; then
-    # Prior run got past the POST (uid persisted) but no handoff_sent_at — resume.
     echo "v-handoff: resuming delivery poll for a previously-sent message (no re-send)"
   else
-    # Persist the nonce as a pre-send attempt marker BEFORE the non-idempotent
-    # POST, so a crash/lost-response between here and the uid write is still
-    # recoverable by nonce on the next run.
-    [ -n "$(jq -r '.handoff_nonce // empty' "$UMBRELLA_STATE")" ] \
-      || merge_state --arg n "$HANDOFF_NONCE" '. + {handoff_nonce: $n}' \
-      || { echo "FAIL v-handoff: could not persist handoff_nonce to state.json" >&2; exit 1; }
-
-    # If a prior attempt left a nonce but no uid, the POST may have been accepted
-    # while its response was lost — look the message up by nonce and resume on it
-    # rather than re-sending a duplicate. Capture via command substitution so a
-    # transient GET failure (curl non-zero) FAILS LOUD here rather than falling
-    # through to a second POST — silently re-sending is exactly what the nonce
-    # exists to prevent. A successful no-match GET returns "\t" (uid+status both
-    # empty); the here-string always carries a trailing newline so the split's
-    # read never hits the EOF-non-zero path.
-    RESUMED=$(fetch_by_nonce) \
-      || { echo "FAIL v-handoff: could not query chat to resume by nonce" >&2; exit 1; }
-    RESUMED_UID=""; RESUMED_STATUS=""
-    IFS=$'\t' read -r RESUMED_UID RESUMED_STATUS <<<"$RESUMED"
-    if [ -n "$RESUMED_UID" ]; then
-      echo "v-handoff: recovered a prior welcome by nonce (lost POST response); resuming, not re-sending"
-      MSG_UID="$RESUMED_UID"; HANDOFF_STATUS="$RESUMED_STATUS"
-      merge_state --arg uid "$MSG_UID" '. + {handoff_msg_uid: $uid}' \
-        || { echo "FAIL v-handoff: could not persist handoff_msg_uid to state.json" >&2; exit 1; }
-    else
-      # No prior message in the chat — safe to send. The nonce rides the body.
-      POST_RESP=$(jq -nc --arg b "$HANDOFF_MSG · ref:$HANDOFF_NONCE" '{body: $b}' \
-        | curl -fsS -K "$CURL_CFG" -H "Content-Type: application/json" \
-            --data-binary @- "$CHAT_BASE/v1/chats/$CHAT_UID/messages") \
-        || { echo "FAIL v-handoff: POST to $CHAT_BASE/v1/chats/\$CHAT_UID/messages returned non-2xx — a rerun resumes by nonce (no re-send)" >&2; exit 1; }
-      MSG_UID=$(printf '%s' "$POST_RESP" | jq -r '.uid // empty')
-      [ -n "$MSG_UID" ] \
-        || { echo "FAIL v-handoff: send response carried no message uid — a rerun resumes by nonce (no re-send)" >&2; exit 1; }
-      # Persist the uid NOW so a crash before the delivery confirm resumes here.
-      merge_state --arg uid "$MSG_UID" '. + {handoff_msg_uid: $uid}' \
-        || { echo "FAIL v-handoff: could not persist handoff_msg_uid to state.json" >&2; exit 1; }
-    fi
+    POST_RESP=$(jq -nc --arg b "$HANDOFF_MSG" '{body: $b}' \
+      | curl -fsS -K "$CURL_CFG" -H "Content-Type: application/json" \
+          --data-binary @- "$CHAT_BASE/v1/chats/$CHAT_UID/messages") \
+      || { echo "FAIL v-handoff: POST to $CHAT_BASE/v1/chats/\$CHAT_UID/messages returned non-2xx" >&2; exit 1; }
+    MSG_UID=$(printf '%s' "$POST_RESP" | jq -r '.uid // empty')
+    [ -n "$MSG_UID" ] \
+      || { echo "FAIL v-handoff: send response carried no message uid" >&2; exit 1; }
+    # Persist the uid NOW (before the poll) so a crash mid-poll resumes here
+    # rather than re-sending. A lost POST *response* (uid never received) may
+    # re-text once on the next run — accepted trade-off (duplicates are fine
+    # for a one-time best-effort welcome).
+    merge_state --arg uid "$MSG_UID" '. + {handoff_msg_uid: $uid}' \
+      || { echo "FAIL v-handoff: could not persist handoff_msg_uid to state.json" >&2; exit 1; }
   fi
 
   # Poll for delivery. A GET failure or an unparseable response is FAIL-loud —
   # never silently treated as 'sent'. HANDOFF_STATUS only ever holds an
-  # *observed* status (it may carry a status already resolved by the nonce
-  # resume above), so an undeliverable/never-listed message FAILs rather than
-  # masquerading as a benign WARN.
+  # *observed* status, so an undeliverable/never-listed message FAILs rather
+  # than masquerading as a benign WARN.
   HANDOFF_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   HANDOFF_DEADLINE=$(( $(date +%s) + 45 ))
+  HANDOFF_STATUS=""
   while :; do
-    # A status already resolved by the nonce-resume above (success OR terminal
-    # failure) short-circuits the poll — no point waiting 45s on a settled state.
-    case "$HANDOFF_STATUS" in delivered|read|failed|undeliverable) break ;; esac
     LIST_RESP=$(curl -fsS -K "$CURL_CFG" "$CHAT_BASE/v1/chats/$CHAT_UID/messages") \
       || { echo "FAIL v-handoff: delivery-poll GET failed for $CHAT_BASE/v1/chats/\$CHAT_UID/messages" >&2; exit 1; }
     printf '%s' "$LIST_RESP" | jq -e . >/dev/null 2>&1 \
