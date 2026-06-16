@@ -48,25 +48,28 @@ set -euo pipefail
 # human touchpoint. The seed-hermes clone (with auth-openai-codex.sh) lives on
 # the Pi; the path expands ON THE PI (escaped), exactly like HERMES_SCAFFOLD below.
 HERMES_SCAFFOLD="${HERMES_SCAFFOLD:-\${SEED_HOME:-\$HOME/seeds}/seed-hermes/hermes-agent}"
-# Skip ONLY when a VALID credential already exists — gate on `hermes auth status`
-# (real credential validity, via the already-running container) NOT a file check:
-# a stale/malformed data/auth.json would fool `test -s`, and `hermes auth add` is
-# *pooled*, so calling it unconditionally would re-run the OAuth and add a
-# duplicate on every re-run. `status` prints "logged out" / "No Codex credentials"
-# when absent or invalid; empty output (e.g. exec failure) also falls through to
-# running the OAuth — fail toward authenticating, never toward a silent skip.
+# Skip ONLY when the credential is AFFIRMATIVELY valid — an allowlist on
+# `hermes auth status` reporting "logged in", NOT a denylist of "not-authed"
+# phrases. A non-empty status that isn't authenticated but is phrased some other
+# way ("credential expired", a re-auth message, any future rephrasing) must not
+# skip; gating on the positive signal makes every other state (logged out,
+# expired, empty/failed exec, unknown) fall through to running the OAuth — the
+# gate fails toward authenticating regardless of phrasing. Use `auth status`
+# (real validity, via the running container), not a file check (a stale/malformed
+# data/auth.json would fool `test -s`); and never an unconditional `hermes auth
+# add` — it is *pooled*, so it would re-run the OAuth + add a duplicate each run.
 STATUS=$(ssh -o StrictHostKeyChecking=accept-new -- "$LD_PI_SSH_TARGET" \
   "cd \"$HERMES_SCAFFOLD\" && docker compose exec -T hermes hermes auth status openai-codex 2>/dev/null" || true)
-if printf '%s' "$STATUS" | grep -qiE 'logged out|no codex credentials' || [ -z "$STATUS" ]; then
-  # Not authenticated (or status unavailable) -> run the one-time OAuth. No `-t`:
+if printf '%s' "$STATUS" | grep -qi 'logged in'; then
+  echo "openai-codex credential already valid on the Pi — skipping OAuth checkpoint"
+else
+  # Not affirmatively authenticated -> run the one-time OAuth. No `-t`:
   # auth-openai-codex.sh runs `docker compose run -T` and relays the device-code
   # URL on stdout (operator approves out-of-band in a browser), polling until
   # Hermes writes data/auth.json — works from a non-TTY installer context.
   ssh -o StrictHostKeyChecking=accept-new -- "$LD_PI_SSH_TARGET" \
       "cd \"$HERMES_SCAFFOLD\" && ./scripts/auth-openai-codex.sh" \
     || { echo "FAIL: openai-codex OAuth checkpoint" >&2; exit 1; }
-else
-  echo "openai-codex credential already valid on the Pi — skipping OAuth checkpoint"
 fi
 ```
 
