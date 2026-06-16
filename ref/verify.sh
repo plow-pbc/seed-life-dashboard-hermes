@@ -245,8 +245,9 @@ done
 # on the login PATH; jq isn't on the Pi). The bearer is read+used on the Pi and
 # never reaches the install host (same discipline as v-link-agent); only the
 # umbrella state.json (handoff_msg_uid / handoff_sent_at) is written locally.
-# send+poll are one SSH call, so a crash of it after the POST may re-text once
-# next run — accepted (duplicates are fine for a one-time best-effort welcome).
+# The welcome POST and the delivery poll are SEPARATE SSH calls, and the uid is
+# persisted right after the POST (before the poll), so only a lost POST
+# *response* can re-text once — accepted (duplicates fine for a one-time welcome).
 GATEWAY_STATE="${SCAFFOLD_DIR%/}/data/gateway_state.json"
 # Connected gate ON THE PI: gateway_state.json is on the Pi; jq isn't in the
 # Pi's package set (node >=20.6 is, per v-children), so parse with node. The
@@ -274,54 +275,65 @@ else
   MSG_UID=$(jq -r '.handoff_msg_uid // empty' "$UMBRELLA_STATE")
   HANDOFF_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-  # Send (if no uid yet) + poll, ALL ON THE PI over SSH — PLOW_CHAT_TOKEN is read
-  # from the scaffold data/.env and used on the Pi; it never reaches the install
-  # host (same discipline as v-link-agent). The remote script validates the base
-  # origin, POSTs the welcome when MSG_UID is empty, polls up to 45s, and prints
-  # "<uid>\t<status>" on success or "ERR …" on a hard failure. jq is absent on
-  # the Pi → JSON via node. AGENT_ENV may contain $HOME and expands on the Pi.
-  HANDOFF_RESULT=$(ssh $SSH_OPTS -- "$PI_TARGET" "AGENT_ENV=\"$AGENT_ENV\" MSG_UID=\"$MSG_UID\" bash -l -s" <<'REMOTE'
+  # SEND — its OWN SSH call on the Pi, run only when no uid is recorded yet, so
+  # the new uid returns and is persisted LOCALLY *before* the delivery poll can
+  # fail/drop. That ordering is what makes "handoff_msg_uid recorded right after
+  # the POST" true: an interrupt during the 45s poll resumes this message next
+  # run instead of re-texting. Token read+used on the Pi (never reaches the
+  # install host); jq absent on the Pi → JSON via node; AGENT_ENV may contain
+  # $HOME and expands on the Pi. Remote prints the uid on stdout, "ERR …" on stderr.
+  if [ -z "$MSG_UID" ]; then
+    MSG_UID=$(ssh $SSH_OPTS -- "$PI_TARGET" "AGENT_ENV=\"$AGENT_ENV\" bash -l -s" <<'REMOTE'
 set -euo pipefail
 TOKEN=$(grep -m1 -E '^PLOW_CHAT_TOKEN=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_TOKEN=//')
 CUID=$(grep -m1 -E '^PLOW_CHAT_CHAT_UID=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_CHAT_UID=//')
-[ -n "$TOKEN" ] || { echo "ERR PLOW_CHAT_TOKEN missing on Pi (plow_chat not activated)"; exit 1; }
-[ -n "$CUID" ]  || { echo "ERR PLOW_CHAT_CHAT_UID missing on Pi (plow_chat not activated)"; exit 1; }
-# Plow Chat API base is the prod origin, inlined: single-operator pre-PMF, no
-# second origin exists — so there's no PLOW_CHAT_BASE_URL knob to read/validate.
-# Bearer via a mode-600 -K config (never on argv); removed on exit.
+[ -n "$TOKEN" ] || { echo "ERR PLOW_CHAT_TOKEN missing on Pi (plow_chat not activated)" >&2; exit 1; }
+[ -n "$CUID" ]  || { echo "ERR PLOW_CHAT_CHAT_UID missing on Pi (plow_chat not activated)" >&2; exit 1; }
+# Bearer via a mode-600 -K config (never on argv); removed on exit. Plow API
+# origin inlined (single-operator pre-PMF, no second origin).
 cfg=$(mktemp); chmod 600 "$cfg"; trap 'rm -f "$cfg"' EXIT
 printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$cfg"
-msg_uid="$MSG_UID"
-if [ -z "$msg_uid" ]; then
-  body=$(node -e 'process.stdout.write(JSON.stringify({body:"✅ Your Life Dashboard is live — the Pi kiosk is up and I'\''m connected here on Hermes. Reply anytime to chat with me."}))')
-  resp=$(printf '%s' "$body" | curl -fsS -K "$cfg" -H "Content-Type: application/json" --data-binary @- "https://api.plow.co/v1/chats/$CUID/messages") \
-    || { echo "ERR welcome POST returned non-2xx"; exit 1; }
-  msg_uid=$(printf '%s' "$resp" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).uid||"")}catch(e){}})')
-  [ -n "$msg_uid" ] || { echo "ERR welcome response carried no message uid"; exit 1; }
-fi
+body=$(node -e 'process.stdout.write(JSON.stringify({body:"✅ Your Life Dashboard is live — the Pi kiosk is up and I'\''m connected here on Hermes. Reply anytime to chat with me."}))')
+resp=$(printf '%s' "$body" | curl -fsS -K "$cfg" -H "Content-Type: application/json" --data-binary @- "https://api.plow.co/v1/chats/$CUID/messages") \
+  || { echo "ERR welcome POST returned non-2xx" >&2; exit 1; }
+uid=$(printf '%s' "$resp" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).uid||"")}catch(e){}})')
+[ -n "$uid" ] || { echo "ERR welcome response carried no message uid" >&2; exit 1; }
+printf '%s' "$uid"
+REMOTE
+) || { echo "FAIL v-handoff: welcome POST on Pi failed" >&2; exit 1; }
+    [ -n "$MSG_UID" ] || { echo "FAIL v-handoff: Pi returned no message uid from the welcome POST" >&2; exit 1; }
+    # Persist the uid NOW — before any poll can fail — so a crash/interruption
+    # during the poll resumes this message next run instead of re-texting.
+    merge_state --arg uid "$MSG_UID" '. + {handoff_msg_uid: $uid}' \
+      || { echo "FAIL v-handoff: could not persist handoff_msg_uid to state.json" >&2; exit 1; }
+  else
+    echo "v-handoff: resuming delivery poll for a previously-sent message (no re-send)"
+  fi
+
+  # POLL for delivery — its own SSH call on the Pi; the uid is already persisted.
+  # Prints the observed status on stdout (empty = never observed), "ERR …" on
+  # stderr + non-zero on a hard GET/parse failure.
+  HANDOFF_STATUS=$(ssh $SSH_OPTS -- "$PI_TARGET" "AGENT_ENV=\"$AGENT_ENV\" MSG_UID=\"$MSG_UID\" bash -l -s" <<'REMOTE'
+set -euo pipefail
+TOKEN=$(grep -m1 -E '^PLOW_CHAT_TOKEN=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_TOKEN=//')
+CUID=$(grep -m1 -E '^PLOW_CHAT_CHAT_UID=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_CHAT_UID=//')
+[ -n "$TOKEN" ] || { echo "ERR PLOW_CHAT_TOKEN missing on Pi" >&2; exit 1; }
+[ -n "$CUID" ]  || { echo "ERR PLOW_CHAT_CHAT_UID missing on Pi" >&2; exit 1; }
+cfg=$(mktemp); chmod 600 "$cfg"; trap 'rm -f "$cfg"' EXIT
+printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$cfg"
 deadline=$(( $(date +%s) + 45 )); status=""
 while :; do
-  resp=$(curl -fsS -K "$cfg" "https://api.plow.co/v1/chats/$CUID/messages") || { echo "ERR delivery-poll GET failed"; exit 1; }
-  st=$(printf '%s' "$resp" | MU="$msg_uid" node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let j;try{j=JSON.parse(s)}catch(e){process.exit(2)}const a=Array.isArray(j)?j:(j.messages||[]);const m=a.find(x=>x&&x.uid===process.env.MU);process.stdout.write(m&&m.status?m.status:"")})') \
-    || { echo "ERR delivery-poll response was not valid JSON"; exit 1; }
+  resp=$(curl -fsS -K "$cfg" "https://api.plow.co/v1/chats/$CUID/messages") || { echo "ERR delivery-poll GET failed" >&2; exit 1; }
+  st=$(printf '%s' "$resp" | MU="$MSG_UID" node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let j;try{j=JSON.parse(s)}catch(e){process.exit(2)}const a=Array.isArray(j)?j:(j.messages||[]);const m=a.find(x=>x&&x.uid===process.env.MU);process.stdout.write(m&&m.status?m.status:"")})') \
+    || { echo "ERR delivery-poll response was not valid JSON" >&2; exit 1; }
   [ -n "$st" ] && status="$st"
   case "$status" in delivered|read) break ;; esac
   [ "$(date +%s)" -ge "$deadline" ] && break
   sleep 5
 done
-printf '%s\t%s\n' "$msg_uid" "$status"
+printf '%s' "$status"
 REMOTE
-) || { echo "FAIL v-handoff (on Pi): ${HANDOFF_RESULT#ERR }" >&2; exit 1; }
-
-  MSG_UID="${HANDOFF_RESULT%%$'\t'*}"
-  HANDOFF_STATUS="${HANDOFF_RESULT#*$'\t'}"
-  [ -n "$MSG_UID" ] || { echo "FAIL v-handoff: Pi returned no message uid" >&2; exit 1; }
-  # Persist the uid locally so a later run resumes this same message (no re-send),
-  # including the offline-'sent' path. A lost POST *response* on the Pi may
-  # re-text once next run — accepted trade-off (duplicates fine for a one-time
-  # best-effort welcome).
-  merge_state --arg uid "$MSG_UID" '. + {handoff_msg_uid: $uid}' \
-    || { echo "FAIL v-handoff: could not persist handoff_msg_uid to state.json" >&2; exit 1; }
+) || { echo "FAIL v-handoff: delivery poll on Pi failed" >&2; exit 1; }
 
   # The latch (handoff_sent_at) is written LOCALLY and ONLY on confirmed
   # delivery. A merely-'sent' (offline) WARNs without latching — the uid stays so
