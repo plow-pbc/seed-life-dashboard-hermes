@@ -236,28 +236,17 @@ while :; do
   sleep 15
 done
 
-# v-handoff: FINAL check — the owner take-over handoff. The kiosk is up and the
-# producers have run (everything above), but the install isn't "handed off" until
-# (a) Hermes is actually SUBSCRIBED to the bound chat (gateway connected — bound
-# but not subscribed means no inbound/outbound flows) and (b) a welcome message
-# has REACHED the owner's device (delivered, not merely accepted). The send is
-# once-only across re-runs: verification runs repeatedly, so it gates on
-# state.json.handoff_sent_at and never re-texts the owner. handoff_msg_uid is
-# persisted the instant the POST returns, so a crash before the delivery confirm
-# resumes polling that message instead of re-sending. (The narrow lost-POST-
-# *response* window — server accepted, reply dropped before the uid reached us —
-# may re-text once on the next run; that's an accepted trade-off for a one-time
-# best-effort notification, not worth a nonce + chat-search.) `sent` = API accepted
-# (necessary, not sufficient); `delivered`/`read` = reached the device (the bar
-# that writes handoff_sent_at). A still-`sent` after the poll window WARNs
-# (recipient device likely offline) WITHOUT writing handoff_sent_at — the uid
-# stays persisted and the next run resumes polling it, so a non-delivered state
-# is never calcified as a completed handoff. In the co-located topology the
-# scaffold lives ON THE PI, so the connected gate, the welcome POST, and the
-# delivery poll all run on the Pi over SSH — the chat bearer (PLOW_CHAT_TOKEN)
-# is read and used on the Pi and never reaches the install host (same discipline
-# as v-link-agent above); only the umbrella state.json (handoff_msg_uid /
-# handoff_sent_at) is written locally.
+# v-handoff: FINAL check — owner take-over handoff. Asserts plow_chat is
+# connected, sends a one-time welcome, and confirms it reached the device. The
+# full contract (once-only gate, delivered-vs-`sent` bar, resume-by-uid, and the
+# accepted lost-window trade-off) lives in SEED.md ## Verification step 7 — not
+# re-derived here. Reading notes: in the co-located topology the connected gate,
+# the POST, and the poll all run ON THE PI over SSH under a login shell (node is
+# on the login PATH; jq isn't on the Pi). The bearer is read+used on the Pi and
+# never reaches the install host (same discipline as v-link-agent); only the
+# umbrella state.json (handoff_msg_uid / handoff_sent_at) is written locally.
+# send+poll are one SSH call, so a crash of it after the POST may re-text once
+# next run — accepted (duplicates are fine for a one-time best-effort welcome).
 GATEWAY_STATE="${SCAFFOLD_DIR%/}/data/gateway_state.json"
 # Connected gate ON THE PI: gateway_state.json is on the Pi; jq isn't in the
 # Pi's package set (node >=20.6 is, per v-children), so parse with node. The
