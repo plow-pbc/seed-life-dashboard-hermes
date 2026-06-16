@@ -21,7 +21,7 @@ API / per-machine state — declared as the `### Requirements` manifest below so
 | input    | Household owner's display name (how the dashboard refers to you) | preflight | LD_OWNER_NAME | |
 | system   | Pi system packages (Node ≥20.6, npm, git, Chromium, emoji font) | preflight | pre-installed on the Pi (probed **up front** per [environment is probed up front](#environment-is-probed-up-front); with passwordless sudo the installer auto-runs the surfaced `apt` line, else the line is surfaced right after inputs land) | |
 | system   | Docker + Compose v2 on the Pi (the seed-hermes scaffold's runtime) | preflight | pre-installed on the Pi (the `seed-hermes` dep's host-tools check installs the Compose plugin if absent); arm64 is native — `nousresearch/hermes-agent:latest` ships a `linux/arm64` variant, so the Pi runs it without qemu and the agent half can `docker compose exec` into it | |
-| auth     | ChatGPT account for Hermes' `openai-codex` OAuth | in-flow (end) | **deferred to the single end-of-install checkpoint** ([skills are activated](#skills-are-activated-first-run)): the container needs no `auth.json` to start, so `seed-hermes` brings it up without auth and the umbrella runs `auth-openai-codex.sh` on the Pi just before the producers (the only step needing the LLM); announced up front per [the Pi-side hands-on moments](#environment-is-probed-up-front) | |
+| auth     | ChatGPT account for Hermes' `openai-codex` OAuth | in-flow   | **deferred to the single end-of-install checkpoint** ([skills are activated](#skills-are-activated-first-run)): the container needs no `auth.json` to start, so `seed-hermes` brings it up without auth and the umbrella runs `auth-openai-codex.sh` on the Pi just before the producers (the only step needing the LLM); announced up front per [the Pi-side hands-on moments](#environment-is-probed-up-front) | |
 | auth     | Plow Chat activation        | preflight | **front-loaded into the prepare-script**: the one-time phone-bind runs up front in the operator's shell (`seed-hermes-plow`'s `create_plow_chat_curl.sh --env-file <inputs-file>`), landing `PLOW_CHAT_*` in the inputs file; the install then writes them into the Pi scaffold's `data/.env` (`--from-env`, no second phone-bind) | PLOW_CHAT_TOKEN |
 
 Context the table can't hold: the Pi's first-contact host key is trusted TOFU via `StrictHostKeyChecking=accept-new` (a *changed* key still hard-fails), and key auth to the Pi is established up front by the `seed-durable-ssh` dep (`ssh-copy-id` at prepare time, only when a BatchMode probe fails); and Plow Chat activation lands `PLOW_CHAT_*` into the scaffold's `data/.env` — the producers read external data and `ld-calendar-nudge` notifies the owner through that gateway — but the phone-bind that mints those values is **front-loaded into the prepare-script** (run once up front in the operator's shell), so the autonomous install never blocks on it; set `PLOW_CHAT_TOKEN` to skip even that up-front step. **Topology is single-Pi (co-located):** the scaffold is no longer a precondition on a separate Docker host — the `seed-hermes` dep (first in the software list) **provisions** it on the Pi (clone + `prepare.sh` + `docker compose up -d` + ready-check — the ChatGPT `openai-codex` OAuth is **deferred to the end-of-install checkpoint**, since container readiness needs no `auth.json`), so there is exactly one machine. The seed-hermes scaffold lives in the `seed-hermes` clone's `hermes-agent/` dir on the Pi; `HERMES_SCAFFOLD` defaults to that on-Pi path and the agent half's `docker compose exec` and the activation block run **on the Pi over SSH** (the same `seed-durable-ssh` transport the viewer rides). Because the image's `linux/arm64` variant runs natively on the Pi (no qemu binfmt handler), the container is fully exec-able — the qemu-can't-exec failure mode of a cross-host arm64 scaffold does not arise.
@@ -48,17 +48,25 @@ set -euo pipefail
 # human touchpoint. The seed-hermes clone (with auth-openai-codex.sh) lives on
 # the Pi; the path expands ON THE PI (escaped), exactly like HERMES_SCAFFOLD below.
 HERMES_SCAFFOLD="${HERMES_SCAFFOLD:-\${SEED_HOME:-\$HOME/seeds}/seed-hermes/hermes-agent}"
-if ssh -o StrictHostKeyChecking=accept-new -- "$LD_PI_SSH_TARGET" \
-     "test -s \"$HERMES_SCAFFOLD/data/auth.json\"" 2>/dev/null; then
-  echo "openai-codex credential already present on the Pi — skipping OAuth checkpoint"
-else
-  # No `-t`: auth-openai-codex.sh runs `docker compose run -T` and relays the
-  # device-code URL + code on stdout (the operator approves out-of-band in a
-  # browser), polling until Hermes writes data/auth.json — so this works from a
-  # non-TTY installer context, matching the other SSH calls in this SEED.
+# Skip ONLY when a VALID credential already exists — gate on `hermes auth status`
+# (real credential validity, via the already-running container) NOT a file check:
+# a stale/malformed data/auth.json would fool `test -s`, and `hermes auth add` is
+# *pooled*, so calling it unconditionally would re-run the OAuth and add a
+# duplicate on every re-run. `status` prints "logged out" / "No Codex credentials"
+# when absent or invalid; empty output (e.g. exec failure) also falls through to
+# running the OAuth — fail toward authenticating, never toward a silent skip.
+STATUS=$(ssh -o StrictHostKeyChecking=accept-new -- "$LD_PI_SSH_TARGET" \
+  "cd \"$HERMES_SCAFFOLD\" && docker compose exec -T hermes hermes auth status openai-codex 2>/dev/null" || true)
+if printf '%s' "$STATUS" | grep -qiE 'logged out|no codex credentials' || [ -z "$STATUS" ]; then
+  # Not authenticated (or status unavailable) -> run the one-time OAuth. No `-t`:
+  # auth-openai-codex.sh runs `docker compose run -T` and relays the device-code
+  # URL on stdout (operator approves out-of-band in a browser), polling until
+  # Hermes writes data/auth.json — works from a non-TTY installer context.
   ssh -o StrictHostKeyChecking=accept-new -- "$LD_PI_SSH_TARGET" \
       "cd \"$HERMES_SCAFFOLD\" && ./scripts/auth-openai-codex.sh" \
     || { echo "FAIL: openai-codex OAuth checkpoint" >&2; exit 1; }
+else
+  echo "openai-codex credential already valid on the Pi — skipping OAuth checkpoint"
 fi
 ```
 
@@ -228,7 +236,7 @@ The mid-install halts a first install can hit (unreachable Pi, missing Pi packag
 
 1. SSH reachability and key auth: proven by the `seed-durable-ssh` recursion — no umbrella-side step; the probes below ride its multiplexed connection.
 2. Pi system packages + sudo posture: run the viewer's system-packages probe (read from the viewer's SEED, already in the installer's host-side preflight cache, shipped over the SSH stdin transport) and `sudo -n true` now. Missing packages with passwordless sudo → nothing surfaces (the installer auto-runs the `apt` line at viewer time per [viewer is installed on the Pi](#viewer-is-installed-on-the-pi-over-ssh)); without passwordless sudo → the exact `apt` line joins the consolidated hand-back. Docker + Compose v2 on the Pi is the `seed-hermes` dep's own host-tools concern (it installs the Compose plugin if absent), checked when that dep recurses.
-3. The two human-auth moments, each pinned to a deterministic boundary so neither lands mid-install. The **Plow Chat phone-bind** is **front-loaded** — completed in the prepare-script up front (its `PLOW_CHAT_*` are already in the inputs file by the time recursion starts; `PLOW_CHAT_TOKEN` skips even that), so nothing about it surfaces here. The **ChatGPT `openai-codex` OAuth** is **end-loaded** — it genuinely cannot be collected at prepare time (its device code is minted live against the running container, which does not exist yet), so it is the install's single human touchpoint at the end-of-install checkpoint ([skills are activated](#skills-are-activated-first-run)); it is **announced here, up front**, so the operator knows exactly one browser approval is coming once provisioning finishes. Between those two boundaries the install runs fully autonomously.
+3. The two human-auth moments are pinned to boundaries (the authoritative statement is the scheduling bullet under [operator inputs are supplied by preflight](#operator-inputs-are-supplied-by-preflight), plus the `### Requirements` `auth` rows) — neither lands mid-install. The **Plow phone-bind** is front-loaded (the prepare-script), so nothing surfaces here; the **ChatGPT `openai-codex` OAuth** is the single end-of-install touchpoint ([skills are activated](#skills-are-activated-first-run)), **announced here** so the operator expects exactly one browser approval once provisioning finishes.
 
 ### Viewer inputs are derived
 
