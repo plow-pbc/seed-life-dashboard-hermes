@@ -262,7 +262,7 @@ GATEWAY_STATE="${SCAFFOLD_DIR%/}/data/gateway_state.json"
 # Connected gate ON THE PI: gateway_state.json is on the Pi; jq isn't in the
 # Pi's package set (node >=20.6 is, per v-children), so parse with node. The
 # path may reference $HOME/$SEED_HOME — it expands on the Pi.
-ssh $SSH_OPTS -- "$PI_TARGET" "GATEWAY_STATE=\"$GATEWAY_STATE\" bash -s" <<'REMOTE' \
+ssh $SSH_OPTS -- "$PI_TARGET" "GATEWAY_STATE=\"$GATEWAY_STATE\" bash -l -s" <<'REMOTE' \
   || { echo "FAIL v-handoff: plow_chat gateway not connected on Pi (gateway_state.json missing/unreadable, or state != connected — chat bound but Hermes not subscribed)" >&2; exit 1; }
 node -e 'const fs=require("fs");let s;try{s=JSON.parse(fs.readFileSync(process.env.GATEWAY_STATE,"utf8"))}catch(e){process.exit(1)}process.exit(s&&s.platforms&&s.platforms.plow_chat&&s.platforms.plow_chat.state==="connected"?0:1)'
 REMOTE
@@ -291,7 +291,7 @@ else
   # origin, POSTs the welcome when MSG_UID is empty, polls up to 45s, and prints
   # "<uid>\t<status>" on success or "ERR …" on a hard failure. jq is absent on
   # the Pi → JSON via node. AGENT_ENV may contain $HOME and expands on the Pi.
-  HANDOFF_RESULT=$(ssh $SSH_OPTS -- "$PI_TARGET" "AGENT_ENV=\"$AGENT_ENV\" MSG_UID=\"$MSG_UID\" bash -s" <<'REMOTE'
+  HANDOFF_RESULT=$(ssh $SSH_OPTS -- "$PI_TARGET" "AGENT_ENV=\"$AGENT_ENV\" MSG_UID=\"$MSG_UID\" bash -l -s" <<'REMOTE'
 set -euo pipefail
 TOKEN=$(grep -m1 -E '^PLOW_CHAT_TOKEN=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_TOKEN=//')
 CUID=$(grep -m1 -E '^PLOW_CHAT_CHAT_UID=' "$AGENT_ENV" | sed 's/^PLOW_CHAT_CHAT_UID=//')
