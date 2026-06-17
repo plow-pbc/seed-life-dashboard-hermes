@@ -33,7 +33,7 @@ Gather these before you start:
 
 ### The hands-on moments
 
-Most of the install is automated. The agent asks the **two non-secret inputs** (the Pi SSH target and your display name) conversationally up front (see the line above); the few **hands-on** steps are pinned to **two boundaries** — up front in the prepare-script, or once at the very end — never scattered mid-install:
+Most of the install is automated. The agent asks the **two non-secret inputs** (the Pi SSH target and your display name) conversationally up front; the few **hands-on** steps are pinned to **two boundaries** — up front in the prepare-script, or once at the very end — never scattered mid-install:
 
 **Up front, in the prepare-script (your own shell):**
 
