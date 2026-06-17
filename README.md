@@ -33,16 +33,17 @@ Gather these before you start:
 
 ### The hands-on moments
 
-Most of the install is automated, and the few steps that need you on hand are pinned to **two boundaries** — up front in the prepare-script, or once at the very end — never scattered mid-install:
+Most of the install is automated. The agent asks the **two non-secret inputs** (the Pi SSH target and your display name) conversationally up front (see the line above); the few **hands-on** steps are pinned to **two boundaries** — up front in the prepare-script, or once at the very end — never scattered mid-install:
 
 **Up front, in the prepare-script (your own shell):**
 
-1. **Plow Chat activation** — the one-time iMessage phone-bind runs *in the prepare-script* (`seed-hermes-plow`'s `create_plow_chat_curl.sh --env-file <inputs-file>`); the resulting `PLOW_CHAT_*` land in the inputs file, and the install writes them onto the Pi later (no second phone-bind). Set `PLOW_CHAT_TOKEN` to skip it entirely.
-2. **The Pi's password** — typed once if a key-auth probe finds none (`ssh-copy-id` during the prepare-script).
+1. **The private calendar ICS URL** (`LD_ICAL_URL`) — entered silently (`read -s`) in the prepare-script so the private-feed URL stays off-transcript (it's the one secret input; the non-secret inputs above are collected via agent questions, not here).
+2. **Plow Chat activation** — the one-time iMessage phone-bind runs *in the prepare-script* (`seed-hermes-plow`'s `create_plow_chat_curl.sh --env-file <inputs-file>`); the resulting `PLOW_CHAT_*` land in the inputs file, and the install writes them onto the Pi later (no second phone-bind). Set `PLOW_CHAT_TOKEN` to skip it entirely.
+3. **The Pi's password** — typed once if a key-auth probe finds none (`ssh-copy-id` during the prepare-script).
 
 **At the very end (one browser approval):**
 
-3. **ChatGPT OAuth** — once the scaffold is provisioned and the container is up, the install pauses *once* for you to approve ChatGPT's `openai-codex` device-code flow in a browser. It can't be collected up front — the device code is minted live against the running container — so it's deferred to this single end-of-install checkpoint (right before the dashboard producers, the only step that needs the model credential).
+4. **ChatGPT OAuth** — once the scaffold is provisioned and the container is up, the install pauses *once* for you to approve ChatGPT's `openai-codex` device-code flow in a browser. It can't be collected up front — the device code is minted live against the running container — so it's deferred to this single end-of-install checkpoint (right before the dashboard producers, the only step that needs the model credential).
 
 Between the prepare-script and that final approval, the install runs fully autonomously — no mid-install prompts.
 
