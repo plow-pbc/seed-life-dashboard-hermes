@@ -324,7 +324,7 @@ printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$cfg"
 deadline=$(( $(date +%s) + 45 )); status=""
 while :; do
   resp=$(curl -fsS -K "$cfg" "https://api.plow.co/v1/chats/$CUID/messages") || { echo "ERR delivery-poll GET failed" >&2; exit 1; }
-  st=$(printf '%s' "$resp" | MU="$MSG_UID" node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let j;try{j=JSON.parse(s)}catch(e){process.exit(2)}const a=Array.isArray(j)?j:(j.messages||[]);const m=a.find(x=>x&&x.uid===process.env.MU);process.stdout.write(m&&m.status?m.status:"")})') \
+  st=$(printf '%s' "$resp" | MU="$MSG_UID" node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let j;try{j=JSON.parse(s)}catch(e){process.exit(2)}const m=(j.data||[]).find(x=>x&&x.uid===process.env.MU);process.stdout.write(m&&m.status?m.status:"")})') \
     || { echo "ERR delivery-poll response was not valid JSON" >&2; exit 1; }
   [ -n "$st" ] && status="$st"
   case "$status" in delivered|read) break ;; esac
